@@ -1,0 +1,58 @@
+diff --git a/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c b/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
+index cdcfbfc..d552ae2 100644
+--- a/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
++++ b/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
+@@ -1803,11 +1803,16 @@ static bool mesh_process_ampe(struct mesh_peer *peer, const uint8_t *body, uint3
+         return false;
+     }
+     uint32_t plain_len = crypt_len - AMPE_AES_BLOCK_SIZE;
+-    uint8_t ampe_buf[2 + 4 + 32 + 32 + 16 + 8 + 4];   /* 98 — the max AMPE element */
++    uint8_t ampe_buf[2 + 4 + 32 + 32 + 16 + 8 + 4 + 64]; /* local change: room for an IGTK block after the MGTK */
+     if (plain_len > sizeof(ampe_buf))
+     {
++        MMLOG_INF("RC-DIAG AMPE drop: plain_len=%u exceeds %u (action=%u body_len=%u mic_off=%u)\n",
++                  (unsigned)plain_len, (unsigned)sizeof(ampe_buf), (unsigned)action, (unsigned)body_len,
++                  (unsigned)mic_off);
+         return false;
+     }
++    MMLOG_INF("RC-DIAG AMPE in: action=%u body_len=%u mic_off=%u plain_len=%u\n", (unsigned)action,
++              (unsigned)body_len, (unsigned)mic_off, (unsigned)plain_len);
+     /* AAD (fixed-6, SWAPPED vs TX): {TA=peer(sa), RA=us, first 6 action-body bytes}. #16: canonicalise the
+      * OPEN body[4:5] to the 11n Supported Rates EID+len (01 08) the peer's driver reconstructs — see the
+      * WLAN_EID_SUPP_RATES note. Copy first (never mutate the RX frame); CONFIRM's window is the AID, skip. */
+@@ -1833,6 +1838,8 @@ static bool mesh_process_ampe(struct mesh_peer *peer, const uint8_t *body, uint3
+         return false;
+     }
+     uint8_t ampe_ie_len = ampe_buf[1];
++    MMLOG_INF("RC-DIAG AMPE ok: action=%u ampe_ie_len=%u plain_len=%u\n", (unsigned)action,
++              (unsigned)ampe_ie_len, (unsigned)plain_len);
+     if (ampe_ie_len < 68 || (uint32_t)(2 + ampe_ie_len) > plain_len)
+     {
+         return false;
+@@ -3481,6 +3488,26 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
+     MMLOG_INF("MESH action RX from " MM_MAC_ADDR_FMT " action=%u len=%u\n",
+               MM_MAC_ADDR_VAL(sa), (unsigned)action, (unsigned)body_len);
+ 
++    /* local change (diagnostic only): print the reason code of a received Close. */
++    if (action == WLAN_SP_MESH_PEERING_CLOSE)
++    {
++        uint32_t o = 2;
++        while (o + 2 <= body_len && o + 2 + body[o + 1] <= body_len)
++        {
++            const uint8_t id = body[o];
++            const uint8_t l = body[o + 1];
++            if (id == 117 && l >= 6)
++            {
++                const uint32_t ro = (l == 24 || l == 8) ? 6 : 4;
++                MMLOG_INF("RC-DIAG Close from " MM_MAC_ADDR_FMT " mpm_len=%u reason=%u\n",
++                          MM_MAC_ADDR_VAL(sa), (unsigned)l,
++                          (unsigned)(body[o + 2 + ro] | ((uint16_t)body[o + 3 + ro] << 8)));
++                break;
++            }
++            o += 2u + l;
++        }
++    }
++
+     uint16_t peer_plid = 0;
+     uint16_t our_llid_echo = 0;
+     uint32_t mic_off = 0;

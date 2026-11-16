@@ -1,0 +1,33 @@
+# Heltec RC32-68 (HT-RC3268) board overlay: ESP32-S3R8, 16 MB flash, MM6108 on the HT-HC01 V2 module.
+# Pins are from the RC32-68 schematic V1.0. The pin table in datasheet Rev 1.0.0 is wrong.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+
+CONFIG_HALOW_COUNTRY_CODE="US"
+
+CONFIG_MM_BUSY=1
+CONFIG_MM_WAKE=8
+CONFIG_MM_RESET_N=9
+CONFIG_MM_SPI_CS=10
+CONFIG_MM_SPI_SCK=11
+CONFIG_MM_SPI_MOSI=12
+CONFIG_MM_SPI_MISO=13
+CONFIG_MM_SPI_IRQ=14
+
+CONFIG_MMHAL_CHIP_TYPE_MM6108=y
+CONFIG_MM_FW_FILE="mm6108.mbin"
+# Heltec's 3.3 V calibration file. Not in this repository. Supplied ready-made through the
+# RC_BCF_MBIN environment variable (see README.md).
+CONFIG_MM_BCF_FILE="bcf_HC01_V2_3V3.mbin"
+
+# PLACEHOLDERS. Real mesh name, channel, subnet and Reticulum server go in the git-ignored
+# file boards/rc32-68/sdkconfig.local (copy sdkconfig.local.example).
+CONFIG_EXAMPLE_MESH_S1G_CHANNEL=43
+CONFIG_EXAMPLE_MESH_ID="example-mesh"
+CONFIG_EXAMPLE_MESH_IPV4_PREFIX="10.9.9."
+CONFIG_RNS_TCP_HOST="192.0.2.10"
+CONFIG_RNS_TCP_PORT=4242

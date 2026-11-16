@@ -1,0 +1,6 @@
+# Copy to sdkconfig.local (git-ignored) and put your own values here.
+CONFIG_EXAMPLE_MESH_ID="your-mesh-name"
+CONFIG_EXAMPLE_MESH_S1G_CHANNEL=43
+CONFIG_EXAMPLE_MESH_IPV4_PREFIX="10.9.9."
+CONFIG_RNS_TCP_HOST="10.9.9.10"
+CONFIG_RNS_TCP_PORT=4242

@@ -1,0 +1,55 @@
+diff --git a/cmake/mm-fw-gen/firmware/CMakeLists.txt b/cmake/mm-fw-gen/firmware/CMakeLists.txt
+index 38a1e10..07cc765 100644
+--- a/cmake/mm-fw-gen/firmware/CMakeLists.txt
++++ b/cmake/mm-fw-gen/firmware/CMakeLists.txt
+@@ -62,6 +62,11 @@ endif()
+ if(NOT EXISTS "${FW_ELF}")
+     message(FATAL_ERROR "firmware ELF '${FW_BIN_NAME}' not found under ${MORSE_FW_DIR}/firmware/")
+ endif()
++# local change: a ready-made calibration .mbin (Heltec's) may be given in RC_BCF_MBIN.
++set(RC_BCF_READY "$ENV{RC_BCF_MBIN}")
++if(RC_BCF_READY AND EXISTS "${RC_BCF_READY}")
++    set(BCF_ELF "${RC_BCF_READY}")
++endif()
+ if(NOT BCF_ELF OR NOT EXISTS "${BCF_ELF}")
+     message(FATAL_ERROR "BCF ELF '${BCF_BIN_NAME}' not found under ${MORSE_FW_DIR}/bcf/")
+ endif()
+@@ -78,12 +83,21 @@ add_custom_command(
+     DEPENDS "${FW_ELF}" "${MBIN_CONVERTER}"
+     COMMENT "Converting firmware ELF -> ${CONFIG_MM_FW_FILE}"
+     VERBATIM)
++if(RC_BCF_READY AND EXISTS "${RC_BCF_READY}")
++add_custom_command(
++    OUTPUT "${BCF_MBIN}"
++    COMMAND "${CMAKE_COMMAND}" -E copy "${RC_BCF_READY}" "${BCF_MBIN}"
++    DEPENDS "${RC_BCF_READY}"
++    COMMENT "Copying ready-made BCF -> ${CONFIG_MM_BCF_FILE}"
++    VERBATIM)
++else()
+ add_custom_command(
+     OUTPUT "${BCF_MBIN}"
+     COMMAND "${python}" "${MBIN_CONVERTER}" -o "${BCF_MBIN}" "${BCF_ELF}"
+     DEPENDS "${BCF_ELF}" "${MBIN_CONVERTER}"
+     COMMENT "Converting BCF ELF -> ${CONFIG_MM_BCF_FILE}"
+     VERBATIM)
++endif()
+ 
+ # --- wrap each .mbin into a linkable object with the symbols morselib expects --
+ # UNCHANGED FROM THE ORIGINAL component (morsemicro/firmware 2.10.4-esp32-2): the
+diff --git a/examples/mesh/CMakeLists.txt b/examples/mesh/CMakeLists.txt
+index df7f98b..3dc0183 100644
+--- a/examples/mesh/CMakeLists.txt
++++ b/examples/mesh/CMakeLists.txt
+@@ -14,3 +14,12 @@ morse_firmware_generate_component()
+ 
+ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ project(mesh)
++
++# local change: library debug logging on the console.
++target_compile_definitions(libmorse PRIVATE MMLOG_LEVEL_DEFAULT=5)
++
++# local change: make the final link wait for the mangled library.
++if(TARGET morselib_build)
++    idf_build_get_property(rc_project_elf EXECUTABLE)
++    add_dependencies(${rc_project_elf} morselib_build)
++endif()

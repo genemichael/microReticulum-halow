@@ -1,0 +1,3543 @@
+/*
+ * Copyright 2022-2025 Morse Micro
+ * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
+ */
+
+#include "dot11/dot11_ies.h"
+#include "mmdrv.h"
+#include "mmpkt_list.h"
+#include "mmpkt.h"
+#include "mmwlan.h"
+#include "mmwlan_internal.h"
+#include "umac/datapath/umac_datapath.h"
+#include "umac/datapath/umac_datapath_private.h"
+#include "umac/data/umac_data.h"
+#include "umac/datapath/datapath_defrag.h"
+#include "umac/regdb/umac_regdb.h"
+#include "umac/relay/umac_relay.h"
+#include "umac/supplicant_shim/umac_supp_shim.h"
+#include "dot11/dot11.h"
+#include "dot11/dot11_utils.h"
+#include "umac/umac.h"
+#include "umac/config/umac_config.h"
+#include "umac/core/umac_core.h"
+#include "common/mac_address.h"
+#include "umac/ps/umac_ps.h"
+#include "umac/stats/umac_stats.h"
+#include "umac/interface/umac_interface.h"
+#include "umac/ap/umac_ap.h"
+#include "umac/connection/umac_connection.h"
+#include "umac/rc/umac_rc.h"
+#include "umac/ba/umac_ba.h"
+#include "umac/twt/umac_twt.h"
+#include "umac/ibss/umac_ibss.h"
+#include "umac/mesh/umac_mesh.h"
+#include "umac/health_check/umac_health_check.h"
+#include "umac/ies/mmie.h"
+#include "umac/frames/disassociation.h"
+#include "umac/frames/deauthentication.h"
+
+#define UMAC_802_1_HEADER_LEN 8
+static const uint8_t snap_802_1h[] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
+
+
+#define MAX_QOS_DATA_MAC_HEADER_LEN (sizeof(struct dot11_data_hdr) + sizeof(struct dot11_qos_ctrl))
+
+
+#define ETHERTYPE_THRESHOLD 1536
+
+
+#define MAX_RX_PROCESS_PER_LOOP (5)
+
+
+#define MAX_TX_PROCESS_PER_LOOP (5)
+
+
+#define RX_REORDER_TIMEOUT_MS (100)
+
+
+#define RX_REORDER_TIMER_PERIOD_MS (RX_REORDER_TIMEOUT_MS / 4)
+
+#ifdef ENABLE_DATAPATH_TRACE
+#include "mmtrace.h"
+static mmtrace_channel datapath_channel_handle;
+#define DATAPATH_TRACE_INIT()     datapath_channel_handle = mmtrace_register_channel("datapath")
+#define DATAPATH_TRACE(_fmt, ...) mmtrace_printf(datapath_channel_handle, _fmt, ##__VA_ARGS__)
+#else
+#define DATAPATH_TRACE_INIT() \
+    do {                      \
+    } while (0)
+#define DATAPATH_TRACE(_fmt, ...) \
+    do {                          \
+    } while (0)
+#endif
+
+
+static bool umac_datapath_tx_is_paused(struct umac_datapath_data *data, uint16_t mask)
+{
+    return (data->tx_paused & mask) != 0;
+}
+
+enum mmwlan_status umac_datapath_wait_for_tx_ready_(struct umac_datapath_data *data,
+                                                    uint32_t timeout_ms,
+                                                    uint16_t mask)
+{
+    if (timeout_ms == UINT32_MAX)
+    {
+        while (umac_datapath_tx_is_paused(data, mask))
+        {
+            mmosal_semb_wait(data->tx_flowcontrol_sem, UINT32_MAX);
+        }
+    }
+    else
+    {
+        uint32_t timeout_at = mmosal_get_time_ms() + timeout_ms;
+
+        while (umac_datapath_tx_is_paused(data, mask))
+        {
+            int32_t sleep_time_ms = timeout_at - mmosal_get_time_ms();
+            if (sleep_time_ms <= 0)
+            {
+                return MMWLAN_TIMED_OUT;
+            }
+
+            mmosal_semb_wait(data->tx_flowcontrol_sem, sleep_time_ms);
+        }
+    }
+
+    return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status umac_datapath_wait_for_tx_ready(struct umac_data *umacd, uint32_t timeout_ms)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    return umac_datapath_wait_for_tx_ready_(data, timeout_ms, UINT16_MAX);
+}
+
+
+static bool umac_datapath_validate_buf_len(struct mmpktview *view, uint32_t min_length)
+{
+    if (mmpkt_get_data_length(view) < min_length)
+    {
+        MMLOG_WRN("Data length too short. Received: %lu; Expected: %lu\n",
+                  mmpkt_get_data_length(view),
+                  min_length);
+        return false;
+    }
+
+    return true;
+}
+
+
+static void umac_datapath_process_s1g_beacon(struct umac_data *umacd, struct mmpktview *rxbufview)
+{
+    struct mmpkt *rxbuf = mmpkt_from_view(rxbufview);
+    const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
+
+    const struct dot11_s1g_beacon_hdr *s1g_header =
+        (struct dot11_s1g_beacon_hdr *)mmpkt_remove_from_start(rxbufview, sizeof(*s1g_header));
+    if (s1g_header == NULL)
+    {
+        MMLOG_WRN("S1G Beacon too short (%lu, expect at least %u)\n",
+                  mmpkt_get_data_length(rxbufview),
+                  sizeof(*s1g_header));
+        return;
+    }
+
+    if (!umac_connection_addr_matches_bssid(umacd, s1g_header->source_addr))
+    {
+        /* MESH: a foreign-BSSID S1G beacon is a peer's beacon. For 802.11s the mesh BSSID
+         * equals the sender's own MAC, so source_addr IS the peer's real address — verified
+         * on-air: a Linux/morse mesh node's S1G beacon reaches here with source_addr = its MAC.
+         * This is usable for peer discovery, unlike the STA/IBSS case below (where source_addr
+         * = BSSID != sender). Strip the optional S1G beacon fields to reach the IEs and let the
+         * mesh module match the Mesh ID and open a peer link. */
+        if (umac_mesh_is_active())
+        {
+            if (dot11_frame_control_get_next_tbtt_present(s1g_header->frame_control))
+            {
+                (void)mmpkt_remove_from_start(rxbufview, DOT11_NEXT_TBTT_LEN);
+            }
+            if (dot11_frame_control_get_cssid_present(s1g_header->frame_control))
+            {
+                (void)mmpkt_remove_from_start(rxbufview, DOT11_CSSID_LEN);
+            }
+            if (dot11_frame_control_get_ano_present(s1g_header->frame_control))
+            {
+                (void)mmpkt_remove_from_start(rxbufview, DOT11_ANO_LEN);
+            }
+            umac_mesh_handle_peer_beacon(s1g_header->source_addr,
+                                         mmpkt_get_data_start(rxbufview),
+                                         mmpkt_get_data_length(rxbufview));
+            return;
+        }
+
+        /* STA/IBSS: do NOT mint a peer from a beacon. IBSS peer discovery is data-driven
+         * (umac_datapath_lookup_stad_by_peer_addr_ibss on a data frame's real TA);
+         * beacons cannot identify peers on this hardware/firmware:
+         *
+         *   - MORSE HARDWARE / FIRMWARE DEPENDENT (mm6108.mbin 1.17.6): the firmware
+         *     does not surface same-cell peer beacons to the host, so a peer ESP32's
+         *     beacon never reaches this handler at all (verified on-air: 0 beacons
+         *     from a 2nd ESP32 here, while the cell formed fine over data frames).
+         *   - A Linux/morse_driver node's S1G beacon carries source_addr = BSSID, not
+         *     the sender's MAC (morse_dot11ah_beacon_to_s1g, SW-4741). So even the
+         *     beacons that ARE surfaced can't identify the sender; minting from one
+         *     just creates a junk "peer" == the BSSID.
+         *
+         * This matches Linux in practice: net/mac80211/ibss.c discovers peers from
+         * mgmt->sa, but the morse RX path sets mgmt->sa = mgmt->bssid (s1g_to_beacon
+         * copies the single S1G address into both), so it is data-driven there too.
+         * Revisit (#16) only if a future firmware surfaces peer beacons with a real
+         * per-node source_addr.
+         *
+         * NOTE — this is also the IBSS-MERGE decision point. A beacon whose
+         * source_addr (= the foreign cell's BSSID) differs from ours is, in Linux,
+         * where ieee80211_rx_bss_info compares TSF and merges (higher TSF wins). We
+         * intentionally do NOT merge: the consuming product (Rimba) is a provisioned
+         * network with a pre-agreed BSSID, so there is only ever one cell and nothing
+         * to reconcile (decided 2026-06-20; backlog #4 out of scope). If a future
+         * deployment needs coordinator-free cell formation, the TSF (beacon
+         * time_stamp) and foreign BSSID (source_addr) needed for the tiebreak are
+         * both present here. */
+        return;
+    }
+
+
+    if (dot11_frame_control_get_next_tbtt_present(s1g_header->frame_control))
+    {
+        (void)mmpkt_remove_from_start(rxbufview, DOT11_NEXT_TBTT_LEN);
+    }
+
+    if (dot11_frame_control_get_cssid_present(s1g_header->frame_control))
+    {
+        (void)mmpkt_remove_from_start(rxbufview, DOT11_CSSID_LEN);
+    }
+
+    if (dot11_frame_control_get_ano_present(s1g_header->frame_control))
+    {
+        (void)mmpkt_remove_from_start(rxbufview, DOT11_ANO_LEN);
+    }
+
+    int16_t new_rssi = rx_metadata->rssi;
+    umac_stats_set_rssi(umacd, new_rssi);
+
+    umac_connection_process_beacon_ies(umacd,
+                                       mmpkt_get_data_start(rxbufview),
+                                       mmpkt_get_data_length(rxbufview));
+}
+
+
+static void umac_datapath_process_rx_extension_frame(struct umac_data *umacd,
+                                                     struct umac_datapath_data *data,
+                                                     struct mmpktview *rxbufview,
+                                                     uint16_t frame_control)
+{
+    uint16_t subtype = dot11_frame_control_get_subtype(frame_control);
+    MM_UNUSED(data);
+
+    switch (subtype)
+    {
+        case DOT11_FC_SUBTYPE_S1G_BEACON:
+            umac_datapath_process_s1g_beacon(umacd, rxbufview);
+            break;
+
+        default:
+            MMLOG_WRN("Recieved unsupported EXT frame: frame_control=0x%04x\n",
+                      le16toh(frame_control));
+            break;
+    }
+}
+
+void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
+                                           struct umac_sta_data *stad,
+                                           struct mmpktview *rxbufview)
+{
+    const struct dot11_action *frame = (struct dot11_action *)mmpkt_get_data_start(rxbufview);
+
+    MMLOG_DBG("Action Category recieved: %u\n", frame->field.category);
+    switch (frame->field.category)
+    {
+        case DOT11_ACTION_CATEGORY_BLOCK_ACK:
+            umac_ba_process_rx_frame(stad,
+                                     mmpkt_get_data_start(rxbufview),
+                                     mmpkt_get_data_length(rxbufview));
+            break;
+
+        case DOT11_ACTION_CATEGORY_PUBLIC:
+        case DOT11_ACTION_CATEGORY_SA_QUERY:
+        case DOT11_ACTION_CATEGORY_WNM:
+        {
+            enum mmwlan_vif vif =
+                umac_interface_get_vif_by_id(umacd, umac_sta_data_get_vif_id(stad));
+            umac_supp_process_mgmt_frame(umacd, rxbufview, vif);
+            break;
+        }
+
+        case DOT11_ACTION_CATEGORY_S1G:
+            umac_relay_process_s1g_action_frame(stad, rxbufview);
+            break;
+
+        case DOT11_ACTION_CATEGORY_S1G_UNPROTECTED:
+            /* TWT Setup/Teardown action frames. The AP responder and the STA requester
+             * each act on their own role; the other call is a no-op for the wrong role. */
+            umac_twt_responder_handle_action(umacd, stad,
+                                             mmpkt_get_data_start(rxbufview),
+                                             mmpkt_get_data_length(rxbufview));
+            umac_twt_requester_handle_action(umacd,
+                                             mmpkt_get_data_start(rxbufview),
+                                             mmpkt_get_data_length(rxbufview));
+            break;
+
+        default:
+            MMLOG_WRN("Unsupported Action Category: %u\n", frame->field.category);
+            break;
+    }
+}
+
+
+static void umac_datapath_process_unprotected_robust_mgmt_frame(struct umac_data *umacd,
+                                                                struct mmpktview *rxbufview)
+{
+    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+
+    MMOSAL_ASSERT(umac_datapath_validate_buf_len(rxbufview, sizeof(*header)));
+
+    if (frame_is_deauthentication(header))
+    {
+        const struct dot11_deauth *deauth = (struct dot11_deauth *)mmpkt_get_data_start(rxbufview);
+        if (!umac_datapath_validate_buf_len(rxbufview, sizeof(*deauth)))
+        {
+            return;
+        }
+
+        MMLOG_DBG("Recieved unprotected deauth frame.\n");
+        umac_supp_process_unprotected_deauth(umacd,
+                                             le16toh(deauth->reason_code),
+                                             dot11_get_sa(&deauth->hdr),
+                                             dot11_get_da(&deauth->hdr));
+    }
+    else if (frame_is_disassociation(header))
+    {
+        const struct dot11_disassoc *disassoc =
+            (struct dot11_disassoc *)mmpkt_get_data_start(rxbufview);
+        if (!umac_datapath_validate_buf_len(rxbufview, sizeof(*disassoc)))
+        {
+            return;
+        }
+
+        MMLOG_DBG("Recieved unprotected disassoc frame.\n");
+        umac_supp_process_unprotected_disassoc(umacd,
+                                               le16toh(disassoc->reason_code),
+                                               dot11_get_sa(&disassoc->hdr),
+                                               dot11_get_da(&disassoc->hdr));
+    }
+    else
+    {
+        MMLOG_DBG("Recieved unexpected unprotected robust management frame.\n");
+    }
+}
+
+
+static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
+                                                struct umac_sta_data *stad,
+                                                uint16_t vif_id,
+                                                struct mmpktview *rxbufview)
+{
+    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+
+    MMOSAL_ASSERT(umac_datapath_validate_buf_len(rxbufview, sizeof(*header)));
+
+    uint16_t frame_control_le = header->frame_control;
+
+    if (frame_is_robust_mgmt(rxbufview))
+    {
+        if (!umac_sta_data_is_associated(stad))
+        {
+
+            return;
+        }
+
+        /* A group-addressed Mesh/Multihop Action frame (HWMP PREQ/PERR/RANN) is a group-privacy
+         * action (frame_is_group_privacy_action / mac80211 _ieee80211_is_group_privacy_action): it is
+         * MGTK/group-privacy class, NOT BIP, and in the morse mesh it is sent unprotected (mesh peers
+         * are MFP=no). net/mac80211 does not subject it to the unprotected-robust-mgmt drop — its
+         * ieee80211_drop_unencrypted_mgmt MFP block is skipped for MFP=no peers (rx.c:2454) — so the
+         * frame reaches the HWMP handler. Without this exemption the broadcast PREQ targeting us is
+         * dropped here and we never emit a PREP, so a Linux peer can't resolve a path to us. */
+        if (!dot11_frame_control_get_protected(frame_control_le) &&
+            umac_sta_data_pmf_is_required(stad) &&
+            !frame_is_mesh_action(rxbufview))
+        {
+            const uint8_t *frame_data = mmpkt_get_data_start(rxbufview) + sizeof(*header);
+            size_t frame_data_len = mmpkt_get_data_length(rxbufview) - sizeof(*header);
+
+
+            if (mm_mac_addr_is_multicast(dot11_get_da(header)) &&
+                (ie_mmie_find(frame_data, frame_data_len) != NULL))
+            {
+                if (!bip_is_valid(stad, header, frame_data, frame_data_len))
+                {
+                    MMLOG_WRN("Invalid frame security, dropping.\n");
+                    return;
+                }
+            }
+            else
+            {
+                umac_datapath_process_unprotected_robust_mgmt_frame(umacd, rxbufview);
+                return;
+            }
+        }
+    }
+
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops != NULL)
+    {
+        datapath_ops->process_rx_mgmt_frame(umacd, stad, rxbufview);
+    }
+}
+
+void umac_datapath_generate_8023_header(const uint8_t *dest_addr,
+                                        const uint8_t *src_addr,
+                                        uint16_t ethertype,
+                                        struct umac_8023_hdr *header)
+{
+    mac_addr_copy(header->src_addr, src_addr);
+    mac_addr_copy(header->dest_addr, dest_addr);
+    header->ethertype_be = htobe16(ethertype);
+}
+
+
+static uint16_t umac_datapath_get_llc_ethertype(struct mmpktview *view)
+{
+    if (!umac_datapath_validate_buf_len(view, UMAC_802_1_HEADER_LEN))
+    {
+        MMLOG_INF("Packet too short for LLC/SNAP header\n");
+        return 0;
+    }
+    uint8_t *header = mmpkt_get_data_start(view);
+
+    if (memcmp(snap_802_1h, header, sizeof(snap_802_1h)) != 0)
+    {
+        MMLOG_DUMP_INF("Unable to find matching LLC/SNAP in buffer:\n    ",
+                       header,
+                       sizeof(snap_802_1h));
+        return 0;
+    }
+
+    uint16_t ethertype;
+    PACK_BE16(ethertype, (header + sizeof(snap_802_1h)));
+
+    return ethertype;
+}
+
+
+static bool umac_datapath_is_eapol_frame(struct mmpktview *rxbufview)
+{
+    return (umac_datapath_get_llc_ethertype(rxbufview) == ETHERTYPE_EAPOL);
+}
+
+
+static void umac_datapath_process_rx_eapol_frame(struct umac_data *umacd,
+                                                 struct mmpktview *rxbufview,
+                                                 const struct dot11_hdr *header)
+{
+
+
+    struct mmdrv_rx_metadata *metadata = mmpkt_get_metadata(mmpkt_from_view(rxbufview)).rx;
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+
+
+    MMOSAL_ASSERT(mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN) != NULL);
+
+    if (datapath_ops != NULL)
+    {
+        datapath_ops->supp_l2_sock_receive(umacd,
+                                           mmpkt_get_data_start(rxbufview),
+                                           mmpkt_get_data_length(rxbufview),
+                                           dot11_get_sa(header));
+    }
+}
+
+
+/* #P5 — host-side CCMP for the mesh data/robust-mgmt path. In HW-crypto mode the MM6108 firmware
+ * withholds a forwarded A4!=TA 4-addr frame from the host (an A4-sensitive *delivery* gate, #20 — NOT a
+ * keys-by-A4 decrypt limit: the same FW delivers+HW-decrypts the forward on Linux). Moving all mesh CCMP
+ * to the host (no FW key offload, see umac_keys_mmdrv_install_key) sidesteps the gate and makes multi-hop
+ * work. Re-verified 2026-07-02 as a host-stack (not FW/BCF, not a FW-command) difference — worklog
+ * docs/worklog/2026-07-02-mesh-20-hwcrypto-reverify.md. Mirrors net/mac80211
+ * ieee80211_crypto_ccmp_{encrypt,decrypt}. Single TX/RX datapath task -> file-static scratch buffers. */
+#define MESH_SW_CCMP_BODY_MAX 1600
+
+/* TX: the mmpkt holds a fully-built [802.11 hdr (+QoS) | body]. Encrypt the body under the active
+ * `key_type` key on `stad` using the current TX PN (the caller must have incremented it — mac80211
+ * increments before use), insert the 8-byte CCMP header between the header and the body, and append the
+ * MIC. Returns false (caller drops) on missing key / oversize / no buffer space. */
+static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmpktview *view,
+                                          enum umac_key_type key_type, int key_id)
+{
+    MM_UNUSED(key_type);   /* PN + key now both keyed by key_id (see umac_keys_get_tx_seq) */
+    const uint8_t *tk = umac_keys_get_key_data(stad, (uint8_t)key_id);
+    size_t tk_len = umac_keys_get_key_len(stad, (uint8_t)key_id);
+    if (tk == NULL || (tk_len != UMAC_KEY_AES_128_LEN && tk_len != UMAC_KEY_AES_256_LEN))
+    {
+        MMLOG_WRN("Mesh SW CCMP TX: no usable key %d\n", key_id);
+        return false;
+    }
+    size_t mic_len = (tk_len == UMAC_KEY_AES_256_LEN) ? DOT11_CCMP_256_MIC_LEN : DOT11_CCMP_128_MIC_LEN;
+
+    uint8_t *hdr = mmpkt_get_data_start(view);
+    uint16_t fc = ((const struct dot11_hdr *)hdr)->frame_control;
+    size_t mac_len = dot11_data_hdr_get_len((const struct dot11_data_hdr *)hdr);
+    bool is_qos = (dot11_frame_control_get_type(fc) == DOT11_FC_TYPE_DATA) &&
+                  (dot11_frame_control_get_subtype(fc) == DOT11_FC_SUBTYPE_QOS_DATA);
+    size_t hdr_total = mac_len + (is_qos ? sizeof(struct dot11_qos_ctrl) : 0);
+
+    size_t total = mmpkt_get_data_length(view);
+    if (total < hdr_total)
+    {
+        return false;
+    }
+    size_t body_len = total - hdr_total;
+    if (body_len > MESH_SW_CCMP_BODY_MAX)
+    {
+        MMLOG_WRN("Mesh SW CCMP TX: body %u > max\n", (unsigned)body_len);
+        return false;
+    }
+
+    /* PN already incremented by the caller (mac80211 increments conf.tx_pn before use).
+     * Pass the resolved key_id — connection_keys no longer maps key_type internally (2.11.2). */
+    uint64_t pn = umac_keys_get_tx_seq(stad, (uint8_t)key_id);
+
+    uint8_t ccmp_hdr[DOT11_CCMP_HEADER_LEN];
+    uint8_t mic[DOT11_CCMP_256_MIC_LEN];
+    uint8_t *body = hdr + hdr_total;
+    /* Encrypt the body IN PLACE (bulk CCM CTR is in==out safe; the CBC-MAC is taken over a scratch copy
+     * before the CTR overwrites). The prepend+memmove below shifts only the MAC header, so the ciphertext
+     * stays put right after the opened CCMP slot — no copy-back needed. */
+    if (mesh_ccmp_encrypt(tk, tk_len, hdr, ccmp_hdr, pn, (uint8_t)key_id,
+                          body, body, body_len, mic) != 0)
+    {
+        return false;
+    }
+
+    if (mmpkt_available_space_at_start(view) < DOT11_CCMP_HEADER_LEN ||
+        mmpkt_available_space_at_end(view) < mic_len)
+    {
+        MMLOG_WRN("Mesh SW CCMP TX: no head/tail room (h=%u t=%u)\n",
+                  (unsigned)mmpkt_available_space_at_start(view),
+                  (unsigned)mmpkt_available_space_at_end(view));
+        return false;
+    }
+
+    /* Open an 8-byte CCMP slot between the header and the body: prepend exposes 8 bytes of headroom at
+     * the front, then slide the MAC header forward over them so the gap lands right after the header. */
+    uint8_t *start = mmpkt_prepend(view, DOT11_CCMP_HEADER_LEN);
+    memmove(start, start + DOT11_CCMP_HEADER_LEN, hdr_total);
+    uint8_t *ccmp_slot = start + hdr_total;
+    memcpy(ccmp_slot, ccmp_hdr, DOT11_CCMP_HEADER_LEN);
+    /* ciphertext already in place at ccmp_slot + CCMP_HEADER_LEN (encrypted in-place above) */
+    memcpy(mmpkt_append(view, mic_len), mic, mic_len);
+    return true;
+}
+
+/* RX: the FW delivered a protected mesh frame raw (no FW key). On entry the 802.11 header + QoS have
+ * been peeled from `view` (it starts at the CCMP header) but `data_hdr` still points at the contiguous
+ * MAC header for the AAD. Look up the key by the CCMP KeyID on `stad` (resolved by TA), decrypt + verify
+ * the MIC, then replay-check the PN in `space` (only after MIC, so a forged MIC can't poison the replay
+ * window), then strip the CCMP header + MIC. `space` = DEFAULT for data, IND_ROBUST_MGMT for unicast
+ * action frames. Returns false (drop) on missing key / MIC / replay failure. This is where a forwarded
+ * A4!=TA frame the FW withholds in HW-crypto mode (#20) is instead delivered raw and decrypted host-side. */
+static bool umac_datapath_sw_ccmp_decrypt(struct umac_sta_data *stad, struct mmpktview *view,
+                                          const struct dot11_data_hdr *data_hdr,
+                                          enum umac_key_rx_counter_space space)
+{
+    size_t avail = mmpkt_get_data_length(view);
+    if (avail < DOT11_CCMP_HEADER_LEN)
+    {
+        return false;
+    }
+    uint8_t *ccmp_hdr = mmpkt_get_data_start(view);
+    uint8_t key_id = mesh_ccmp_key_id(ccmp_hdr);
+
+    const uint8_t *tk = umac_keys_get_key_data(stad, key_id);
+    size_t tk_len = umac_keys_get_key_len(stad, key_id);
+    if (tk == NULL || (tk_len != UMAC_KEY_AES_128_LEN && tk_len != UMAC_KEY_AES_256_LEN))
+    {
+        MMLOG_WRN("Mesh SW CCMP RX: no key %u\n", key_id);
+        return false;
+    }
+    size_t mic_len = (tk_len == UMAC_KEY_AES_256_LEN) ? DOT11_CCMP_256_MIC_LEN : DOT11_CCMP_128_MIC_LEN;
+    if (avail < DOT11_CCMP_HEADER_LEN + mic_len)
+    {
+        return false;
+    }
+    size_t body_len = avail - DOT11_CCMP_HEADER_LEN - mic_len;
+    if (body_len > MESH_SW_CCMP_BODY_MAX)
+    {
+        return false;
+    }
+    uint8_t *ct = ccmp_hdr + DOT11_CCMP_HEADER_LEN;
+    const uint8_t *mic = ct + body_len;
+
+    /* Decrypt IN PLACE (bulk CCM CTR is in==out safe); after stripping the CCMP header below, the
+     * plaintext is already where the data starts — no copy-back. */
+    if (mesh_ccmp_decrypt(tk, tk_len, (const uint8_t *)data_hdr, ccmp_hdr,
+                          ct, ct, body_len, mic) != 0)
+    {
+        return false; /* MIC failure */
+    }
+    /* MIC verified -> now it's safe to advance the replay counter. */
+    if (!ccmp_is_valid(stad, ccmp_hdr, space))
+    {
+        return false; /* replay */
+    }
+
+    (void)mmpkt_remove_from_start(view, DOT11_CCMP_HEADER_LEN);
+    /* plaintext already in place (decrypted in-place above); just drop the CCMP header + MIC */
+    if (mmpkt_remove_from_end(view, mic_len) == NULL)
+    {
+        return false;
+    }
+    return true;
+}
+
+static void umac_datapath_process_rx_data_frame_after_reorder(
+    struct umac_sta_data *stad,
+    struct umac_datapath_sta_data *sta_data,
+    struct mmpkt *rxbuf,
+    struct mmpktview *rxbufview)
+{
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+
+    const struct dot11_data_hdr *data_hdr =
+        (const struct dot11_data_hdr *)mmpkt_get_data_start(rxbufview);
+    const size_t data_hdr_len = dot11_data_hdr_get_len(data_hdr);
+
+    data_hdr = (const struct dot11_data_hdr *)mmpkt_remove_from_start(rxbufview, data_hdr_len);
+
+    MMOSAL_ASSERT(data_hdr);
+
+    const struct dot11_hdr *header = &data_hdr->base;
+
+    uint8_t tid_index = MMDRV_SEQ_NUM_BASELINE;
+    const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
+    bool mesh_ctrl_present = false;
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(rx_metadata);
+
+    if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
+    {
+        const struct dot11_qos_ctrl *qos_control =
+            (struct dot11_qos_ctrl *)mmpkt_remove_from_start(rxbufview, sizeof(*qos_control));
+
+        MMOSAL_ASSERT(qos_control);
+
+        /* 802.11s "Mesh Control Present" (QoS Control bit 8): a Mesh Control header follows. */
+        mesh_ctrl_present = (le16toh(qos_control->field) & 0x0100u) != 0;
+
+        if (!mm_mac_addr_is_multicast(dot11_get_ra(header)))
+        {
+            tid_index = dot11_qos_control_get_tid(qos_control->field);
+        }
+    }
+
+    /* Forced-topology test (bench): drop MESH data frames whose immediate transmitter (TA) isn't an
+     * allowed neighbour, so a node exchanges mesh data only via its chosen relay even though all bench
+     * nodes are in RF range. Gated on mesh_ctrl_present (802.11s Mesh Control header) so it applies ONLY
+     * to mesh frames — NOT to concurrent AP-client frames on a mesh+AP node (an AP client's data has no
+     * Mesh Control header, so it is never filtered here). No-op when the allowlist is empty (normal ops). */
+    if (mesh_ctrl_present && !umac_mesh_peer_allowed(dot11_get_ta(header)))
+    {
+        goto drop;
+    }
+
+
+    if ((umac_sta_data_get_security_type(stad) != MMWLAN_OPEN) &&
+        !dot11_frame_control_get_protected(header->frame_control) &&
+        !umac_datapath_is_eapol_frame(rxbufview))
+    {
+        MMLOG_INF("Received NON EAPOL frame in plain text.\n");
+        goto drop;
+    }
+
+    /* Defrag-before-decrypt for mesh SW-CCMP (encrypt-then-fragment). The host encrypts the WHOLE frame
+     * (one CCMP header + one MIC, computed over the unfragmented FC), then the MM6108 FW fragments it —
+     * replicating the MAC header per fragment but leaving the CCMP header only on fragment 0 and the MIC
+     * only on the last fragment. So each fragment is NOT independently decryptable; the correct order is
+     * reassemble the raw (still-encrypted) fragments, then decrypt the whole once. (mac80211's
+     * decrypt-then-defrag order is for fragment->encrypt = host-side fragmentation, which this FW mangles
+     * — see the reverted 9c7daabd.) Only for a protected, FW-raw-delivered, mesh SW-CCMP UNICAST fragment;
+     * everything else keeps the normal decrypt-then-defrag path below. */
+    bool reassembled = false;
+    if (dot11_frame_control_get_protected(header->frame_control) &&
+        !(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED) &&
+        umac_mesh_is_active() && umac_mesh_sw_crypto_enabled() && mesh_ctrl_present &&
+        !mm_mac_addr_is_multicast(dot11_get_da(header)) &&
+        (dot11_frame_control_get_more_fragments(header->frame_control) ||
+         dot11_sequence_control_get_fragment_number(header->sequence_control) != 0))
+    {
+        /* Save the full [MAC header + QoS Control] CONTIGUOUSLY for the CCMP AAD before reassembling.
+         * datapath_defrag re-prepends only the MAC header (dot11_data_hdr_get_len omits the separate 2-byte
+         * QoS Control, which was peeled from the view above), so in the reassembled buffer the byte after
+         * the MAC header is the CCMP PN — but mesh_ccmp_aad_nonce reads the QoS/TID contiguously after the
+         * header. Copy header+QoS here (still adjacent in this fragment's buffer) and clear MoreFragments +
+         * fragment# = 0 so the AAD matches the unfragmented header the host authenticated over. Both resets
+         * are REQUIRED: mesh_ccmp_aad_nonce masks neither MoreFragments nor the frag# (it masks only the
+         * sequence number), and aad_hdr was copied from a fragment carrying MoreFrags/frag#!=0. */
+        uint8_t aad_hdr[MAX_QOS_DATA_MAC_HEADER_LEN];
+        size_t aad_hdr_len = data_hdr_len + sizeof(struct dot11_qos_ctrl);
+        MMOSAL_ASSERT(aad_hdr_len <= sizeof(aad_hdr));
+        memcpy(aad_hdr, data_hdr, aad_hdr_len);
+        struct dot11_hdr *ah = (struct dot11_hdr *)aad_hdr;
+        ah->frame_control = htole16(le16toh(ah->frame_control) & ~DOT11_MASK_FC_MORE_FRAGMENTS);
+        DOT11_SEQUENCE_CONTROL_SET_FRAGMENT_NUMBER(ah->sequence_control, 0);
+
+        MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
+        rxbuf = datapath_defrag(umacd, &sta_data->defrag_data, &data_hdr, &rxbufview, rxbuf, tid_index);
+        if (rxbuf == NULL)
+        {
+            MMOSAL_DEV_ASSERT(rxbufview == NULL);
+            return; /* accumulating fragments — wait for the last one before decrypting */
+        }
+        header = &data_hdr->base;               /* reassembled frame's header (for downstream addresses) */
+        /* datapath_defrag released the original rxbuf, so the old rx_metadata now dangles; the reassembled
+         * buffer is a defrag-alloc mmpkt with NO RX metadata (mmdrv_get_rx_metadata would assert on it — it
+         * is "for RX frames" only). rx_metadata is not read again on the reassembled path, so clear it
+         * (mirrors the normal decrypt-then-defrag path, which sets rx_metadata = NULL before defrag). */
+        rx_metadata = NULL;
+        /* Decrypt the reassembled whole frame; the view is now [CCMP hdr][ciphertext][MIC]. Use the saved
+         * contiguous [MAC header + QoS] as the AAD header (the reassembled buffer's header omits the QoS). */
+        if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, (const struct dot11_data_hdr *)aad_hdr,
+                                           UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
+        {
+            umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+            goto drop;
+        }
+        reassembled = true;
+    }
+
+    if (!reassembled && dot11_frame_control_get_protected(header->frame_control))
+    {
+        if (rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED)
+        {
+            /* FW HW-decrypted: strip the CCMP header (+ replay-check) and the MIC it left in place. */
+            uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
+            if (ccmp_header == NULL ||
+                !ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
+            {
+                umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+                goto drop;
+            }
+
+
+            if (mmpkt_remove_from_end(rxbufview, DOT11_CCMP_128_MIC_LEN) == NULL)
+            {
+                MMLOG_WRN("Drop frame as rxbuf was shorter than expected");
+                goto drop;
+            }
+        }
+        else if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
+        {
+            /* #P5d — FW delivered the protected mesh frame raw (no FW key offloaded). Decrypt on the host,
+             * keyed by TA. This is where a forwarded A4!=TA frame works: in HW-crypto mode the FW does not
+             * deliver such a forward (an A4-sensitive delivery gate, #20 — re-verified 2026-07-02 as a
+             * host-stack, not a FW-command, difference); with no FW key it delivers it raw, so host CCMP runs. */
+            if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, data_hdr,
+                                               UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
+            {
+                umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+                goto drop;
+            }
+        }
+        else
+        {
+            MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x, SEQ: 0x%04x).\n",
+                      le16toh(header->frame_control),
+                      le16toh(header->sequence_control));
+            goto drop;
+        }
+    }
+
+    if (mesh_ctrl_present)
+    {
+        /* Peer liveness: a decrypted mesh frame (data included) refreshes the transmitter's
+         * inactivity timer, mirroring Linux updating sta last_rx on every received frame
+         * (rx.c:4810). TA = immediate transmitter = the peer we heard from. Keeps an actively-
+         * communicating peer alive even if we miss its beacons (else MESH_PLINK_INACTIVITY_MS). */
+        umac_mesh_note_peer_rx(dot11_get_ta(header));
+    }
+
+    if (tid_index <= MMWLAN_MAX_QOS_TID &&
+        (dot11_frame_control_get_protected(header->frame_control) ||
+         umac_sta_data_get_security_type(stad) == MMWLAN_OPEN))
+    {
+        umac_ba_set_expected_rx_seq_num(stad, tid_index, dot11_get_next_sequence_control(header));
+    }
+
+
+
+
+    if (reassembled)
+    {
+        /* The mesh SW-CCMP fragment path already reassembled the raw frame + decrypted the whole above;
+         * skip the mcast checks (a fragment here is unicast) and the normal decrypt-then-defrag below. */
+    }
+    else if (mm_mac_addr_is_broadcast(dot11_get_da(header)) ||
+        mm_mac_addr_is_multicast(dot11_get_da(header)))
+    {
+        if (dot11_frame_control_get_more_fragments(header->frame_control))
+        {
+            MMLOG_INF("Drop Mcast/Bcast frame with fragment bit on\n");
+            goto drop;
+        }
+
+
+        if (dot11_frame_control_get_from_ds(header->frame_control) &&
+            umac_interface_addr_matches_mac_addr(stad, dot11_get_sa_data(data_hdr)))
+        {
+            MMLOG_DBG("Filter out Bcast frame which AP relayed for us\n");
+            goto drop;
+        }
+    }
+    else
+    {
+
+        MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
+        rx_metadata = NULL;
+        rxbuf =
+            datapath_defrag(umacd, &sta_data->defrag_data, &data_hdr, &rxbufview, rxbuf, tid_index);
+        if (rxbuf == NULL)
+        {
+
+            MMOSAL_DEV_ASSERT(rxbufview == NULL);
+            return;
+        }
+        else
+        {
+            header = &data_hdr->base;
+            MMOSAL_DEV_ASSERT(mmpkt_from_view(rxbufview) == rxbuf);
+            MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
+        }
+    }
+
+    if (umac_datapath_is_eapol_frame(rxbufview))
+    {
+        if (dot11_is_4addr_hdr(header->frame_control))
+        {
+            MMLOG_INF("Received 4-address EAPOL frame. Not supported\n");
+            goto drop;
+        }
+
+
+        umac_datapath_process_rx_eapol_frame(umacd, rxbufview, header);
+        goto drop;
+    }
+
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops == NULL)
+    {
+        goto drop;
+    }
+
+    if (datapath_ops->get_sta_state(stad) != MMWLAN_STA_CONNECTED)
+    {
+        MMLOG_DBG("%s Controlled Port is currently closed.\n", datapath_ops->type);
+        goto drop;
+    }
+
+    /* 802.11s: strip the Mesh Control header (between the MAC header and LLC/SNAP) so the
+     * LLC/SNAP + payload extraction below works. Length depends on the address-extension flags
+     * (mirrors net/mac80211): base 6 (flags, ttl, seqnum), +6 for AE_A4, +12 for AE_A5_A6. */
+    uint8_t mesh_ttl = 0;
+    uint32_t mesh_seqnum = 0;
+    /* S4c — carry the proxied endpoints of an AE_A5_A6 frame to the relay branch below, so a relayed
+     * proxied frame keeps eaddr1/eaddr2 (a multi-hop gate would otherwise lose them). */
+    bool rx_ae = false;      /* AE_A5_A6 (unicast, 6-addr): eaddr1 = final DA, eaddr2 = original SA */
+    bool rx_ae_a4 = false;   /* AE_A4 (multicast, proxied group): eaddr1 = original off-mesh source */
+    uint8_t rx_eaddr1[MMWLAN_MAC_ADDR_LEN] = { 0 };
+    uint8_t rx_eaddr2[MMWLAN_MAC_ADDR_LEN] = { 0 };
+    if (mesh_ctrl_present)
+    {
+        const uint8_t *mctrl = (const uint8_t *)mmpkt_get_data_start(rxbufview);
+        uint32_t mctrl_len = 6;
+        if (mctrl != NULL)
+        {
+            mesh_ttl = mctrl[1];
+            mesh_seqnum = (uint32_t)mctrl[2] | ((uint32_t)mctrl[3] << 8) | ((uint32_t)mctrl[4] << 16) |
+                          ((uint32_t)mctrl[5] << 24);
+            uint8_t ae = mctrl[0] & 0x03u;
+            if (ae == 0x01u)
+            {
+                mctrl_len += 6;
+                /* S5 broadcast bridging — AE_A4 (net/mac80211 multicast Address-Extension): eaddr1
+                 * (mctrl[6..11]) = the proxied off-mesh SOURCE. Learn mpp(eaddr1 -> mesh_sa) so a reply
+                 * to that source routes back via this originator, and deliver the frame locally as
+                 * [dst=group][src=eaddr1] (RX-deliver below). Bounds-checked against the view. */
+                if (mmpkt_get_data_length(rxbufview) >= mctrl_len)
+                {
+                    rx_ae_a4 = true;
+                    memcpy(rx_eaddr1, &mctrl[6], MMWLAN_MAC_ADDR_LEN);
+                    umac_mesh_mpp_learn(&mctrl[6], dot11_get_sa_data(data_hdr));
+                }
+            }
+            else if (ae == 0x02u)
+            {
+                mctrl_len += 12;
+                /* S3 — 6-address Address Extension (net/mac80211 ieee80211_rx_mesh_data): EXTRACT the
+                 * proxied endpoints instead of discarding them. eaddr1 (mctrl[6..11]) = final DA (addr5),
+                 * eaddr2 (mctrl[12..17]) = original SA (addr6, the off-mesh host). S4 will use eaddr2 for
+                 * MPP learning (mpp_path_add(eaddr2, mesh_sa)) + eaddr1 for proxied delivery; S3 proves the
+                 * parse. Bounds-checked against the view so a truncated AE frame can't over-read. */
+                if (mmpkt_get_data_length(rxbufview) >= mctrl_len)
+                {
+                    MMLOG_INF("MESH AE rx: eaddr1(DA)=" MM_MAC_ADDR_FMT " eaddr2(SA)=" MM_MAC_ADDR_FMT
+                              "\n", MM_MAC_ADDR_VAL(&mctrl[6]), MM_MAC_ADDR_VAL(&mctrl[12]));
+                    /* Record for the S3 probe accessor (MMLOG above isn't on the ESP UART). */
+                    umac_mesh_note_ae_rx(&mctrl[6], &mctrl[12]);
+                    /* S4 — MPP learning (net/mac80211 mpp_path_add on AE RX, rx.c:2889): the off-mesh
+                     * source eaddr2 is reachable via this frame's mesh SA (addr4). Proxied delivery to
+                     * eaddr1 (the final DA) is wired in S5 (the gate L2 bridge). */
+                    umac_mesh_mpp_learn(&mctrl[12], dot11_get_sa_data(data_hdr));
+                    /* S4c — capture the endpoints so the relay branch can re-emit AE (multi-hop gates). */
+                    rx_ae = true;
+                    memcpy(rx_eaddr1, &mctrl[6], MMWLAN_MAC_ADDR_LEN);
+                    memcpy(rx_eaddr2, &mctrl[12], MMWLAN_MAC_ADDR_LEN);
+                }
+            }
+        }
+        (void)mmpkt_remove_from_start(rxbufview, mctrl_len);
+        /* S5 — hand the proxied AE frame's endpoints + payload to the app (the gate delivers it to its AP
+         * side, addressed to eaddr1). The buffer is now [LLC/SNAP][L3] after the strip; the mesh RX ext-cb
+         * downstream can't recover eaddr1/eaddr2. Notification only — the relay/delivery below is unchanged. */
+        if (rx_ae)
+        {
+            /* S5 finishing touch — if the app cb CONSUMED the frame (a gate that injected it onto its AP
+             * side, S5b), skip the normal local delivery below to avoid a double-delivery (the gate's own
+             * mesh netif would otherwise also see it + spuriously ip_forward it). A plain endpoint node
+             * registers no cb / returns false, so its local delivery (RX-deliver-eaddrs) is unaffected. */
+            if (umac_mesh_ae_rx_deliver(rx_eaddr1, rx_eaddr2, mmpkt_get_data_start(rxbufview),
+                                        mmpkt_get_data_length(rxbufview)))
+            {
+                goto drop;
+            }
+        }
+    }
+
+    /* MESH forwarding (ESP as an intermediate hop). The buffer is now [LLC/SNAP][payload].
+     *  - Group-addressed (bcast/mcast, e.g. ARP): re-broadcast through the mesh (dedup via RMC)
+     *    AND deliver locally.
+     *  - Unicast whose mesh DA isn't us: relay toward the next hop (fresh copy), don't deliver. */
+    if (mesh_ctrl_present)
+    {
+        const uint8_t *mesh_da = dot11_get_da(header);
+        const uint8_t *mesh_sa = dot11_get_sa_data(data_hdr);
+        if (mm_mac_addr_is_multicast(mesh_da))
+        {
+            if (umac_mesh_handle_group_data(mesh_sa, mesh_ttl, mesh_seqnum, rx_ae_a4, rx_eaddr1,
+                                            mmpkt_get_data_start(rxbufview),
+                                            mmpkt_get_data_length(rxbufview)))
+            {
+                goto drop; /* duplicate / our own echo — don't deliver again */
+            }
+            /* fresh group frame: re-broadcast done; fall through to local delivery */
+        }
+        else if (!umac_interface_addr_matches_mac_addr(stad, mesh_da))
+        {
+            MMLOG_INF("MESH relay%s " MM_MAC_ADDR_FMT " -> " MM_MAC_ADDR_FMT "\n",
+                      rx_ae ? " (AE)" : "", MM_MAC_ADDR_VAL(mesh_sa), MM_MAC_ADDR_VAL(mesh_da));
+            /* S4c — a relayed AE_A5_A6 frame is re-emitted AE (eaddr1/eaddr2 preserved) so a multi-hop
+             * gate keeps the proxied endpoints; a plain frame relays non-AE as before. */
+            (void)umac_mesh_forward_data(mesh_da, mesh_sa, rx_ae, rx_eaddr1, rx_eaddr2,
+                                         mmpkt_get_data_start(rxbufview),
+                                         mmpkt_get_data_length(rxbufview));
+            goto drop;
+        }
+    }
+
+    /* Per-vif host-slot demux: the FW stamps each RX frame with its ingress vif_id, so a
+     * concurrent mesh (VIF_STA slot) and AP (VIF_AP slot) are disambiguated natively — the old
+     * mesh_ctrl-based framing heuristic is retired. */
+    enum mmwlan_vif vif = umac_interface_get_vif_by_id(umacd, vif_id);
+    if (vif == MMWLAN_VIF_UNSPECIFIED)
+    {
+        MMLOG_WRN("Invalid RX VIF\n");
+        goto drop;
+    }
+
+    uint16_t llc_ethertype = umac_datapath_get_llc_ethertype(rxbufview);
+    if (!llc_ethertype)
+    {
+        goto drop;
+    }
+
+
+    mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN);
+
+    umac_relay_process_data_frame(stad, vif, tid_index, data_hdr, llc_ethertype, &rxbufview);
+    if (rxbufview == NULL)
+    {
+
+        return;
+    }
+
+
+    /* S5c round-trip — for a proxied AE_A5_A6 frame delivered to the LOCAL stack, the 802.3 header must
+     * carry the PROXIED endpoints (dst=eaddr1, src=eaddr2), so the stack sees the frame as from the real
+     * off-mesh source (e.g. an AP client behind a gate) and replies to IT, not to the mesh forwarder/gate.
+     * Mirrors net/mac80211 ieee80211_strip_8023_mesh_hdr. GATED on eaddr1==us ("we are the true final
+     * endpoint"): a GATE proxying for an off-mesh client has mesh_da(addr3)==us but eaddr1=client!=us and
+     * also reaches this line (its relay branch doesn't fire) — it MUST keep the [dst=addr3][src=addr4]
+     * header (its mesh->AP delivery is the separate S5b hook; rewriting would disturb its ip_forward path).
+     * Non-AE frames keep the mesh DA/SA. (relayed AE frames already `goto drop` above and never reach here.) */
+    bool deliver_ae = rx_ae && umac_interface_addr_matches_mac_addr(stad, rx_eaddr1);
+    struct umac_8023_hdr header_8023 = { 0 };
+    if (deliver_ae)
+    {
+        /* AE_A5_A6 unicast, we are the final endpoint: [dst=eaddr1][src=eaddr2]. */
+        umac_datapath_generate_8023_header(rx_eaddr1, rx_eaddr2, llc_ethertype, &header_8023);
+    }
+    else if (rx_ae_a4)
+    {
+        /* AE_A4 proxied multicast: keep the group DA, take the SRC from eaddr1 (the real off-mesh source)
+         * == net/mac80211 ieee80211_strip_8023_mesh_hdr (h_source=eaddr1, h_dest unchanged). So a node's
+         * stack sees an AP client's broadcast (e.g. ARP) as [dst=broadcast][src=client] and can reply. */
+        umac_datapath_generate_8023_header(dot11_get_da(header), rx_eaddr1, llc_ethertype, &header_8023);
+    }
+    else
+    {
+        umac_datapath_generate_8023_header(dot11_get_da(header), dot11_get_sa_data(data_hdr),
+                                           llc_ethertype, &header_8023);
+    }
+
+    mmwlan_rx_pkt_ext_cb_t rx_pkt_cb;
+    void *arg = NULL;
+
+    rx_pkt_cb = umac_interface_get_rx_pkt_ext_cb(umacd, vif, &arg);
+    if (rx_pkt_cb != NULL)
+    {
+        struct mmwlan_rx_metadata metadata = {
+            .vif = vif,
+            .tid = tid_index,
+            .ta = dot11_get_ta(&data_hdr->base),
+        };
+
+        mmpkt_prepend_data(rxbufview, (const uint8_t *)&header_8023, sizeof(header_8023));
+        mmpkt_close(&rxbufview);
+        rx_pkt_cb(rxbuf, &metadata, arg);
+
+        return;
+    }
+    if (data->rx_pkt_callback != NULL)
+    {
+        mmpkt_prepend_data(rxbufview, (const uint8_t *)&header_8023, sizeof(header_8023));
+        mmpkt_close(&rxbufview);
+        data->rx_pkt_callback(rxbuf, data->rx_arg);
+
+        return;
+    }
+    if (data->rx_callback != NULL)
+    {
+        data->rx_callback((uint8_t *)&header_8023,
+                          sizeof(header_8023),
+                          mmpkt_get_data_start(rxbufview),
+                          mmpkt_get_data_length(rxbufview),
+                          data->rx_arg);
+        goto drop;
+    }
+    MMLOG_WRN("No RX callback registered by the network stack.\n");
+    goto drop;
+
+drop:
+    mmpkt_close(&rxbufview);
+    mmpkt_release(rxbuf);
+}
+
+
+static void umac_datapath_flush_rx_reorder_list(struct umac_sta_data *stad,
+                                                struct umac_datapath_sta_data *sta_data)
+{
+    struct mmpkt *pkt;
+    while ((pkt = mmpkt_list_dequeue(&sta_data->rx_reorder_list)) != NULL)
+    {
+        struct mmpktview *view = mmpkt_open(pkt);
+        umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, pkt, view);
+    }
+}
+
+void umac_datapath_flush_rx_reorder_list_for_tid(struct umac_sta_data *stad, uint16_t tid)
+{
+    struct mmpkt *pkt;
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+
+    if (sta_data->rx_reorder_tid != tid)
+    {
+        return;
+    }
+
+    umac_datapath_flush_rx_reorder_list(stad, sta_data);
+
+    while ((pkt = mmpkt_list_dequeue(&sta_data->rx_reorder_list)) != NULL)
+    {
+        struct mmpktview *view = mmpkt_open(pkt);
+        umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, pkt, view);
+    }
+}
+
+
+static void umac_datapath_evaluate_rx_reorder_list(struct umac_data *umacd,
+                                                   struct umac_sta_data *stad,
+                                                   struct umac_datapath_sta_data *sta_data)
+{
+    while (!mmpkt_list_is_empty(&sta_data->rx_reorder_list))
+    {
+        bool dequeue = false;
+        struct mmpkt *pkt = mmpkt_list_peek(&sta_data->rx_reorder_list);
+        struct mmpktview *view = mmpkt_open(pkt);
+        const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(view);
+        uint16_t seq_ctrl = le16toh(header->sequence_control);
+        int32_t ret;
+
+        ret = umac_ba_get_expected_rx_seq_num(stad, sta_data->rx_reorder_tid);
+        if (ret < 0 || seq_ctrl == (uint16_t)ret)
+        {
+            dequeue = true;
+        }
+        else if (mmosal_time_has_passed(
+                     mmpkt_get_metadata(pkt).rx->read_timestamp_ms + RX_REORDER_TIMEOUT_MS))
+        {
+            umac_stats_increment_datapath_rx_reorder_timedout(umacd);
+            dequeue = true;
+        }
+
+        if (dequeue)
+        {
+            mmpkt_list_remove(&sta_data->rx_reorder_list, pkt);
+            umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, pkt, view);
+        }
+        else
+        {
+            mmpkt_close(&view);
+            return;
+        }
+    }
+}
+
+static void umac_datapath_rx_reorder_timeout_handler(void *arg1, void *arg2)
+{
+    struct umac_data *umacd = (struct umac_data *)arg1;
+    struct umac_sta_data *stad = (struct umac_sta_data *)arg2;
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+
+    umac_datapath_evaluate_rx_reorder_list(umacd, stad, sta_data);
+    if (!mmpkt_list_is_empty(&sta_data->rx_reorder_list))
+    {
+        bool ok = umac_core_register_timeout(umacd,
+                                             RX_REORDER_TIMER_PERIOD_MS,
+                                             umac_datapath_rx_reorder_timeout_handler,
+                                             umacd,
+                                             stad);
+        if (!ok)
+        {
+            MMLOG_WRN("Failed to schedule RX reorder timeout\n");
+        }
+    }
+}
+
+
+static void umac_datapath_add_rx_mpdu_to_reorder_list(struct umac_data *umacd,
+                                                      struct umac_sta_data *stad,
+                                                      struct umac_datapath_sta_data *sta_data,
+                                                      struct mmpkt *rxbuf,
+                                                      uint16_t seq_ctrl,
+                                                      uint8_t reorder_list_maxlen)
+{
+    struct mmpkt *walk = NULL;
+    struct mmpkt *next;
+    struct mmpkt *head;
+    struct mmpktview *headview;
+    const struct dot11_hdr *head_header;
+    uint16_t head_seq_ctrl;
+    bool reorder_list_full;
+
+    if (mmpkt_list_is_empty(&sta_data->rx_reorder_list))
+    {
+        bool ok = umac_core_register_timeout(umacd,
+                                             RX_REORDER_TIMER_PERIOD_MS,
+                                             umac_datapath_rx_reorder_timeout_handler,
+                                             umacd,
+                                             stad);
+        if (!ok)
+        {
+            MMLOG_WRN("Failed to schedule RX reorder timeout\n");
+        }
+
+        mmpkt_list_append(&sta_data->rx_reorder_list, rxbuf);
+        umac_stats_increment_datapath_rx_reorder_total(umacd);
+        umac_stats_update_datapath_rx_reorder_list_high_water_mark(
+            umacd,
+            mmpkt_list_length(&sta_data->rx_reorder_list));
+        return;
+    }
+
+    head = mmpkt_list_peek(&sta_data->rx_reorder_list);
+    headview = mmpkt_open(head);
+    head_header = (struct dot11_hdr *)mmpkt_get_data_start(headview);
+    head_seq_ctrl = le16toh(head_header->sequence_control);
+    head_header = NULL;
+    mmpkt_close(&headview);
+    head = NULL;
+
+    if (head_seq_ctrl == seq_ctrl)
+    {
+        mmpkt_release(rxbuf);
+        umac_stats_increment_datapath_rx_reorder_retransmit_drops(umacd);
+        return;
+    }
+
+    reorder_list_full = mmpkt_list_length(&sta_data->rx_reorder_list) >= reorder_list_maxlen;
+
+
+    if (dot11_sequence_control_lt(seq_ctrl, head_seq_ctrl))
+    {
+        if (reorder_list_full)
+        {
+
+            mmpkt_release(rxbuf);
+            umac_stats_increment_datapath_rx_reorder_overflow(umacd);
+        }
+        else
+        {
+            mmpkt_list_prepend(&sta_data->rx_reorder_list, rxbuf);
+            umac_stats_increment_datapath_rx_reorder_total(umacd);
+            umac_stats_update_datapath_rx_reorder_list_high_water_mark(
+                umacd,
+                mmpkt_list_length(&sta_data->rx_reorder_list));
+        }
+        return;
+    }
+
+    if (reorder_list_full)
+    {
+        struct mmpkt *deq;
+        struct mmpktview *deqview;
+
+
+        deq = mmpkt_list_dequeue(&sta_data->rx_reorder_list);
+        deqview = mmpkt_open(deq);
+        umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, deq, deqview);
+        umac_stats_increment_datapath_rx_reorder_overflow(umacd);
+    }
+
+
+
+    MMPKT_LIST_WALK(&sta_data->rx_reorder_list, walk, next)
+    {
+        struct mmpktview *nextview;
+        const struct dot11_hdr *next_header;
+        uint16_t next_seq_ctrl;
+
+        if (next == NULL)
+        {
+
+            break;
+        }
+
+        nextview = mmpkt_open(next);
+        next_header = (struct dot11_hdr *)mmpkt_get_data_start(nextview);
+        next_seq_ctrl = le16toh(next_header->sequence_control);
+        mmpkt_close(&nextview);
+
+        if (next_seq_ctrl == seq_ctrl)
+        {
+            mmpkt_release(rxbuf);
+            umac_stats_increment_datapath_rx_reorder_retransmit_drops(umacd);
+            return;
+        }
+
+        if (dot11_sequence_control_lt(seq_ctrl, next_seq_ctrl))
+        {
+
+            break;
+        }
+    }
+
+    MMOSAL_ASSERT(walk != NULL);
+    mmpkt_list_insert_after(&sta_data->rx_reorder_list, walk, rxbuf);
+    umac_stats_increment_datapath_rx_reorder_total(umacd);
+    umac_stats_update_datapath_rx_reorder_list_high_water_mark(
+        umacd,
+        mmpkt_list_length(&sta_data->rx_reorder_list));
+
+
+    umac_datapath_evaluate_rx_reorder_list(umacd, stad, sta_data);
+}
+
+
+static void umac_datapath_process_rx_data_frame(struct umac_data *umacd,
+                                                struct umac_sta_data *stad,
+                                                struct mmpkt *rxbuf,
+                                                struct mmpktview *rxbufview)
+{
+    int32_t ret;
+    uint16_t seq_ctrl;
+    uint16_t expected_seq_ctrl;
+    uint8_t tid_index = MMDRV_SEQ_NUM_BASELINE;
+    const struct dot11_data_hdr *data_hdr =
+        (const struct dot11_data_hdr *)mmpkt_get_data_start(rxbufview);
+    const struct dot11_hdr *const header = &data_hdr->base;
+    const size_t data_hdr_len = dot11_data_hdr_get_len(data_hdr);
+    uint8_t reorder_buf_size;
+
+    if (stad == NULL)
+    {
+        MMLOG_DBG("Dropping frame, not transmitted from our AP.\n");
+        goto drop;
+    }
+
+    /* IBSS: stash per-frame RSSI on the sender's peer record and fire
+     * the per-frame rx cb. Gated on umac_ibss_is_active() so AP/STA
+     * paths pay just a single-bool check here. */
+    if (umac_ibss_is_active())
+    {
+        const struct mmdrv_rx_metadata *rxmeta = mmdrv_get_rx_metadata(rxbuf);
+        if (rxmeta != NULL)
+        {
+            umac_ibss_record_peer_rx(dot11_get_ta(header), rxmeta->rssi);
+        }
+    }
+
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+
+    if ((dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_NULL_DATA) ||
+        (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_NULL))
+    {
+        MMLOG_DBG("Dropping NULL data frame.\n");
+        goto drop;
+    }
+
+    if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
+    {
+        MMLOG_VRB("Remove extra QOS CNTL bytes (%p)\n", rxbuf);
+
+        const struct dot11_qos_ctrl *qos_control =
+            (const struct dot11_qos_ctrl *)((const uint8_t *)data_hdr + data_hdr_len);
+
+        if (!mm_mac_addr_is_multicast(dot11_get_ra(header)))
+        {
+            tid_index = dot11_qos_control_get_tid(qos_control->field);
+        }
+    }
+
+    reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, tid_index);
+
+    /* A fragmented MPDU (More Fragments set, or fragment number != 0) bypasses BA reordering. 802.11 makes
+     * A-MPDU and fragmentation mutually exclusive, and an FW-fragmented mesh SW-CCMP frame shares ONE
+     * sequence number across all its fragments — so the BA window (which advances per sequence number)
+     * would drop the 2nd+ fragment as "outdated". Deliver fragments straight to the after-reorder path,
+     * where they are reassembled (raw) then decrypted. No-op for unfragmented frames. */
+    bool is_fragment = dot11_frame_control_get_more_fragments(header->frame_control) ||
+                       (dot11_sequence_control_get_fragment_number(header->sequence_control) != 0);
+
+    if (tid_index > MMWLAN_MAX_QOS_TID || reorder_buf_size == 0 || is_fragment)
+    {
+        umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, rxbuf, rxbufview);
+        return;
+    }
+
+
+    if (sta_data->rx_reorder_tid != tid_index)
+    {
+        umac_datapath_flush_rx_reorder_list(stad, sta_data);
+        sta_data->rx_reorder_tid = tid_index;
+    }
+
+    ret = umac_ba_get_expected_rx_seq_num(stad, tid_index);
+    if (ret < 0)
+    {
+
+        umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, rxbuf, rxbufview);
+        return;
+    }
+
+
+    expected_seq_ctrl = (uint16_t)ret;
+
+    seq_ctrl = le16toh(header->sequence_control);
+    if (seq_ctrl == expected_seq_ctrl)
+    {
+
+        umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, rxbuf, rxbufview);
+        rxbuf = NULL;
+        rxbufview = NULL;
+        umac_datapath_evaluate_rx_reorder_list(umacd, stad, sta_data);
+        return;
+    }
+    else
+    {
+        if (dot11_sequence_control_lt(seq_ctrl, expected_seq_ctrl))
+        {
+
+            umac_stats_increment_datapath_rx_reorder_outdated_drops(umacd);
+            MMLOG_DBG("Dropping outdated frame (SEQ: 0x%x, EXP: 0x%x)\n",
+                      seq_ctrl,
+                      expected_seq_ctrl);
+            goto drop;
+        }
+        else
+        {
+
+            mmpkt_close(&rxbufview);
+            umac_datapath_add_rx_mpdu_to_reorder_list(umacd,
+                                                      stad,
+                                                      sta_data,
+                                                      rxbuf,
+                                                      seq_ctrl,
+                                                      reorder_buf_size);
+            rxbuf = NULL;
+            return;
+        }
+    }
+
+drop:
+    mmpkt_close(&rxbufview);
+    mmpkt_release(rxbuf);
+}
+
+
+static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd,
+                                                         struct umac_sta_data *stad,
+                                                         struct mmpktview *rxbufview)
+{
+    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    uint16_t frame_control_le = header->frame_control;
+
+    if (!dot11_frame_control_get_protected(frame_control_le))
+    {
+        return true;
+    }
+
+    struct mmpkt *rxbuf = mmpkt_from_view(rxbufview);
+    const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
+
+    if (!(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED))
+    {
+        /* #P5d — a protected unicast mesh action frame (e.g. PREP under the pairwise MTK) the FW
+         * delivered raw (no FW key). SW-decrypt it on the host, mirroring the data-frame path. Without
+         * this the relay drops every encrypted PREP and HWMP path discovery never resolves. */
+        if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
+        {
+            mmpkt_remove_from_start(rxbufview, sizeof(*header)); /* peel the MAC header; AAD uses it */
+            if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, (const struct dot11_data_hdr *)header,
+                                               UMAC_KEY_RX_COUNTER_SPACE_IND_ROBUST_MGMT))
+            {
+                umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+                return false;
+            }
+            uint8_t *sw_hdr_dest = mmpkt_prepend(rxbufview, sizeof(*header));
+            memmove(sw_hdr_dest, header, sizeof(*header));
+            return true;
+        }
+
+        MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x).\n",
+                  le16toh(frame_control_le));
+        return false;
+    }
+
+
+    mmpkt_remove_from_start(rxbufview, sizeof(*header));
+
+
+    uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
+    if (!ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_IND_ROBUST_MGMT))
+    {
+        MMLOG_WRN("Unable to validate frame security, dropping.\n");
+        umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+        return false;
+    }
+
+
+    uint8_t *hdr_dest = mmpkt_prepend(rxbufview, sizeof(*header));
+    memmove(hdr_dest, header, sizeof(*header));
+
+    return true;
+}
+
+
+static enum mmwlan_frame_filter_flag umac_datapath_rx_frame_filter_matches(struct umac_data *umacd,
+                                                                           enum dot11_fc_type type,
+                                                                           uint16_t subtype)
+{
+    const struct umac_datapath_data *datapath = umac_data_get_datapath(umacd);
+
+    if (type == DOT11_FC_TYPE_MGMT)
+    {
+        return (enum mmwlan_frame_filter_flag)(datapath->rx_frame_filter & (1u << subtype));
+    }
+    return MMWLAN_FRAME_NO_MATCH;
+}
+
+
+static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
+                                                 struct umac_sta_data *stad,
+                                                 struct umac_datapath_data *data,
+                                                 struct mmpkt *rxbuf,
+                                                 struct mmpktview *rxbufview)
+{
+    const struct dot11_hdr *header = (const struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+
+    MMOSAL_ASSERT(!dot11_is_4addr_hdr(header->frame_control));
+
+    const enum dot11_fc_type frame_type =
+        (enum dot11_fc_type)dot11_frame_control_get_type(header->frame_control);
+    const uint16_t frame_subtype = dot11_frame_control_get_subtype(header->frame_control);
+
+
+    if (frame_type == DOT11_FC_TYPE_MGMT &&
+        (dot11_sequence_control_get_fragment_number(header->sequence_control) ||
+         dot11_frame_control_get_more_fragments(header->frame_control)))
+    {
+        const struct dot11_data_hdr *data_hdr =
+            (const struct dot11_data_hdr *)mmpkt_get_data_start(rxbufview);
+        const size_t data_hdr_len = dot11_data_hdr_get_len(data_hdr);
+
+
+        data_hdr = (const struct dot11_data_hdr *)mmpkt_remove_from_start(rxbufview, data_hdr_len);
+        if (data_hdr == NULL)
+        {
+            goto drop;
+        }
+
+
+        struct mmdrv_rx_metadata saved_metadata = *mmdrv_get_rx_metadata(rxbuf);
+
+        struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+        rxbuf = datapath_defrag(umacd,
+                                &sta_data->defrag_data,
+                                &data_hdr,
+                                &rxbufview,
+                                rxbuf,
+                                MMDRV_SEQ_NUM_BASELINE);
+        if (rxbuf == NULL)
+        {
+
+            return;
+        }
+
+
+        header = &data_hdr->base;
+        mmpkt_prepend(rxbufview, dot11_data_hdr_get_len(data_hdr));
+
+
+        *mmdrv_get_rx_metadata(rxbuf) = saved_metadata;
+    }
+
+    const enum mmwlan_frame_filter_flag frame_filter_flag =
+        umac_datapath_rx_frame_filter_matches(umacd, frame_type, frame_subtype);
+    const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
+
+    if (frame_type == DOT11_FC_TYPE_MGMT &&
+        !umac_datapath_process_mgmt_frame_ccmp_header(umacd, stad, rxbufview))
+    {
+        MMLOG_WRN("Dropping management frame due to CCMP header (aid=%u)\n",
+                  stad ? umac_sta_data_get_aid(stad) : -1);
+        goto drop;
+    }
+
+    if (frame_filter_flag != MMWLAN_FRAME_NO_MATCH && data->rx_frame_cb != NULL)
+    {
+        struct mmwlan_rx_frame_info frame_info = {
+            .frame_filter_flag = frame_filter_flag,
+            .buf = mmpkt_get_data_start(rxbufview),
+            .buf_len = mmpkt_get_data_length(rxbufview),
+            .freq_100khz = rx_metadata->freq_100khz,
+            .rssi_dbm = rx_metadata->rssi,
+            .bw_mhz = rx_metadata->bw_mhz,
+        };
+        data->rx_frame_cb(&frame_info, data->rx_frame_cb_arg);
+    }
+
+    switch (frame_type)
+    {
+        case DOT11_FC_TYPE_MGMT:
+            umac_datapath_process_rx_mgmt_frame(umacd, stad, rx_metadata->vif_id, rxbufview);
+            break;
+
+        case DOT11_FC_TYPE_EXT:
+            umac_datapath_process_rx_extension_frame(umacd, data, rxbufview, header->frame_control);
+            break;
+
+        case DOT11_FC_TYPE_CTRL:
+            MMLOG_INF("Control frame ignored.\n");
+            break;
+
+        case DOT11_FC_TYPE_DATA:
+
+            MMOSAL_ASSERT(false);
+            break;
+
+        default:
+            MMLOG_ERR("Unexpected frame type received.\n");
+            break;
+    }
+
+drop:
+    mmpkt_close(&rxbufview);
+    mmpkt_release(rxbuf);
+}
+
+
+static bool umac_datapath_is_rx_frame_duplicate(struct umac_datapath_sta_data *sta_data,
+                                                struct mmpktview *rxbufview)
+{
+    uint8_t tid_index;
+    struct dot11_data_hdr *data_hdr = (struct dot11_data_hdr *)mmpkt_get_data_start(rxbufview);
+    struct dot11_hdr *header = &data_hdr->base;
+    const uint32_t data_hdr_len = dot11_data_hdr_get_len(data_hdr);
+
+
+    if (dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_EXT)
+    {
+        return false;
+    }
+
+
+    MMOSAL_ASSERT(umac_datapath_validate_buf_len(rxbufview, data_hdr_len));
+
+
+    if (mm_mac_addr_is_broadcast(dot11_get_da(header)) ||
+        mm_mac_addr_is_multicast(dot11_get_da(header)))
+    {
+        return false;
+    }
+
+
+    if (dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_CTRL)
+    {
+        return false;
+    }
+
+
+    if ((dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_DATA) &&
+        (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_NULL))
+    {
+        return false;
+    }
+
+    if ((dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_DATA) &&
+        (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA))
+    {
+        const struct dot11_qos_ctrl *qos_control =
+            (struct dot11_qos_ctrl *)(mmpkt_get_data_start(rxbufview) + data_hdr_len);
+        if (!umac_datapath_validate_buf_len(rxbufview, data_hdr_len + sizeof(*qos_control)))
+        {
+            MMLOG_INF("No QoS control field\n");
+
+            return true;
+        }
+        tid_index = dot11_qos_control_get_tid(qos_control->field);
+    }
+    else
+    {
+        tid_index = MMDRV_SEQ_NUM_BASELINE;
+    }
+
+    if (tid_index >= MMDRV_SEQ_NUM_SPACES)
+    {
+        MMLOG_WRN("Received out of range TID: %d.\n", tid_index);
+
+        return true;
+    }
+
+
+    if (dot11_frame_control_get_retry(header->frame_control) &&
+        sta_data->rx_seq_num_spaces[tid_index] == header->sequence_control)
+    {
+
+        MMLOG_INF("Duplicate detected SEQ: 0x%x\n", header->sequence_control);
+        return true;
+    }
+
+
+    sta_data->rx_seq_num_spaces[tid_index] = header->sequence_control;
+    return false;
+}
+
+
+static bool umac_datapath_rx_frame_allowed_pre_association(
+    const struct umac_datapath_ops *datapath_ops,
+    uint16_t frame_ver_type_subtype,
+    uint16_t frame_control_le)
+{
+
+    if (frame_ver_type_subtype != DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON) &&
+        dot11_frame_control_get_protected(frame_control_le))
+    {
+        return false;
+    }
+
+    for (const uint16_t *iter = datapath_ops->frames_allowed_pre_association; *iter != UINT16_MAX;
+         iter++)
+    {
+        if (frame_ver_type_subtype == *iter)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool umac_datapath_filter_all_beacons(struct umac_data *umacd)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    return data->filter_beacons;
+}
+
+void umac_datapath_set_filter_all_beacons(struct umac_data *umacd, bool filter)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    data->filter_beacons = filter;
+}
+
+
+struct umac_datapath_vif_reassignment
+{
+
+    uint32_t ver_type_subtype;
+
+    uint16_t interface_type_mask;
+};
+
+
+/* Returns true if the frame type is LUT-managed (has an authoritative owner interface), whether or
+ * not the target interface currently exists; false for any other frame type. When the target exists
+ * the frame's rx vif_id is overridden to it. Callers apply this unconditionally for the LUT types
+ * (their owner is fixed by frame type, not by the FW's rx-vif tag). */
+static bool umac_datapath_reassign_vif_id(struct umac_data *umacd,
+                                          struct mmdrv_rx_metadata *metadata,
+                                          uint32_t frame_ver_type_subtype,
+                                          const struct umac_datapath_vif_reassignment *lut,
+                                          size_t n_lut_rows)
+{
+    for (size_t ii = 0; ii < n_lut_rows; ii++)
+    {
+        if (lut[ii].ver_type_subtype == frame_ver_type_subtype)
+        {
+            uint16_t new_vif_id = umac_interface_get_vif_id(umacd, lut[ii].interface_type_mask);
+            if (new_vif_id != MMDRV_VIF_ID_INVALID)
+            {
+                MMLOG_VRB(
+                    "RX frame %x:%x: VIF ID %u->%u\n",
+                    ((frame_ver_type_subtype & DOT11_MASK_FC_TYPE) >> DOT11_SHIFT_FC_TYPE),
+                    ((frame_ver_type_subtype & DOT11_MASK_FC_SUBTYPE) >> DOT11_SHIFT_FC_SUBTYPE),
+                    metadata->vif_id,
+                    new_vif_id);
+                MMOSAL_DEV_ASSERT(new_vif_id < UINT8_MAX);
+                metadata->vif_id = new_vif_id;
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+static bool umac_datapath_rx_frame_preprocess(struct umac_data *umacd, struct mmpktview *rxbufview)
+{
+    bool drop_frame = false;
+    uint16_t frame_ver_type_subtype;
+
+
+    const struct dot11_data_hdr *data_hdr =
+        (const struct dot11_data_hdr *)mmpkt_get_data_start(rxbufview);
+    const struct dot11_hdr *header = &data_hdr->base;
+    uint32_t header_len = dot11_data_hdr_get_len(data_hdr);
+
+    if (!umac_datapath_validate_buf_len(rxbufview, sizeof(header->frame_control)))
+    {
+        MMLOG_WRN("Frame length invalid. Dropping.\n");
+        drop_frame = true;
+        goto exit;
+    }
+
+    frame_ver_type_subtype = dot11_frame_control_get_ver_type_subtype(header->frame_control);
+
+    /* Promiscuous monitor tap: deliver every frame the firmware surfaces to a registered
+     * monitor callback, before any address/BSSID filtering below discards it. This is how a
+     * monitor/sniffer build observes foreign-BSSID beacons (mesh/IBSS/AP) and probe frames. */
+    {
+        struct umac_datapath_data *mon = umac_data_get_datapath(umacd);
+        if (mon->monitor_cb != NULL)
+        {
+            struct mmpkt *rxbuf = mmpkt_from_view(rxbufview);
+            const struct mmdrv_rx_metadata *rx_md = mmdrv_get_rx_metadata(rxbuf);
+            const struct mmwlan_monitor_rx_info info = {
+                .buf = mmpkt_get_data_start(rxbufview),
+                .buf_len = mmpkt_get_data_length(rxbufview),
+                .freq_100khz = rx_md->freq_100khz,
+                .rssi_dbm = rx_md->rssi,
+                .bw_mhz = rx_md->bw_mhz,
+            };
+            mon->monitor_cb(&info, mon->monitor_cb_arg);
+        }
+    }
+
+    if (frame_ver_type_subtype == DOT11_VER_TYPE_SUBTYPE(0, CTRL, RTS))
+    {
+
+        MMLOG_INF("Dropping RTS frame.\n");
+        drop_frame = true;
+        goto exit;
+    }
+
+    if (frame_ver_type_subtype == DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON))
+    {
+        /* DIAG (mesh P2): count EVERY S1G beacon the firmware delivers to the host,
+         * before any host-side filter — answers "does the firmware surface peer beacons?" */
+        {
+            static uint32_t s1g_bcn_diag;
+            if ((++s1g_bcn_diag % 20u) == 1u)
+            {
+                MMLOG_DBG("S1Gbcn diag #%u filtered=%d\n", (unsigned)s1g_bcn_diag,
+                          (int)umac_datapath_filter_all_beacons(umacd));
+            }
+        }
+
+        if (umac_datapath_filter_all_beacons(umacd))
+        {
+            MMLOG_VRB("Dropping beacon.\n");
+            drop_frame = true;
+            goto exit;
+        }
+
+        header_len = sizeof(struct dot11_s1g_beacon_hdr);
+    }
+
+
+    if (!umac_datapath_validate_buf_len(rxbufview, header_len))
+    {
+        MMLOG_INF("Frame too short, drop.\n");
+        drop_frame = true;
+        goto exit;
+    }
+
+    struct mmdrv_rx_metadata *metadata = mmpkt_get_metadata(mmpkt_from_view(rxbufview)).rx;
+    if (metadata == NULL)
+    {
+        MMLOG_WRN("Metadata error.\n");
+        MMOSAL_DEV_ASSERT(false);
+        drop_frame = true;
+        goto exit;
+    }
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+
+    /* Authoritative frame-type -> owner-interface routing, applied REGARDLESS of the FW's rx-vif tag.
+     * A PROBE_REQ is always for the AP; a beacon/PROBE_RSP is always for the STA. On a concurrent
+     * mesh+AP radio the mesh 'claims' broadcast RX, so the FW tags a client's PROBE_REQ with the mesh
+     * vif (a VALID id, so the old INVALID-only guard skipped it) -> the probe routed to the mesh ops
+     * and the AP never answered -> the client could never associate. reassign only overrides when the
+     * target interface exists, so this is a no-op for mesh-only / STA-only / plain-AP. */
+    static const struct umac_datapath_vif_reassignment vif_reassignment_lut[] = {
+        { DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_REQ), UMAC_INTERFACE_AP },
+        { DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON), UMAC_INTERFACE_STA },
+        { DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_RSP), UMAC_INTERFACE_STA },
+    };
+
+    bool lut_managed = umac_datapath_reassign_vif_id(umacd,
+                                                     metadata,
+                                                     frame_ver_type_subtype,
+                                                     vif_reassignment_lut,
+                                                     MM_ARRAY_COUNT(vif_reassignment_lut));
+
+    vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+
+    if (vif_id == MMDRV_VIF_ID_INVALID && !lut_managed)
+    {
+        MMLOG_WRN("RX VIF unknown, frame type %x:%x\n",
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_TYPE) >> DOT11_SHIFT_FC_TYPE),
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_SUBTYPE) >> DOT11_SHIFT_FC_SUBTYPE));
+    }
+
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+
+    if (datapath_ops == NULL)
+    {
+
+        MMLOG_DBG("No ops for vif_id %u. Dropping RX frame %x:%x\n",
+                  vif_id,
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_TYPE) >> DOT11_SHIFT_FC_TYPE),
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_SUBTYPE) >> DOT11_SHIFT_FC_SUBTYPE));
+        drop_frame = true;
+        goto exit;
+    }
+
+    if (!umac_datapath_rx_frame_allowed_pre_association(datapath_ops,
+                                                        frame_ver_type_subtype,
+                                                        header->frame_control))
+    {
+        const uint8_t *ta = dot11_get_ta(header);
+        struct umac_sta_data *stad = datapath_ops->lookup_stad_by_peer_addr(umacd, ta);
+        if (stad == NULL)
+        {
+            MMLOG_WRN("Dropping packet from unknown sender " MM_MAC_ADDR_FMT " (%04x, vif_id %u)\n",
+                      MM_MAC_ADDR_VAL(ta),
+                      frame_ver_type_subtype,
+                      vif_id);
+            drop_frame = true;
+            datapath_ops->handle_frame_unknown_sta(umacd, ta);
+            goto exit;
+        }
+
+        if (umac_interface_addr_matches_mac_addr(stad, dot11_get_sa_data(data_hdr)))
+        {
+            MMLOG_INF("Source address matches our MAC address, dropping received frame.\n");
+            drop_frame = true;
+            goto exit;
+        }
+
+        struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+        if (umac_datapath_is_rx_frame_duplicate(sta_data, rxbufview))
+        {
+            MMLOG_INF("Dropping duplicate frame. Type %u, Subtype %u.\n",
+                      dot11_frame_control_get_type(header->frame_control),
+                      dot11_frame_control_get_subtype(header->frame_control));
+            drop_frame = true;
+            goto exit;
+        }
+    }
+
+exit:
+    return drop_frame;
+}
+
+void umac_datapath_init(struct umac_data *umacd)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+    DATAPATH_TRACE_INIT();
+
+    memset(data, 0, sizeof(*data));
+
+    data->tx_flowcontrol_sem = mmosal_semb_create("txfc");
+    MMOSAL_ASSERT(data->tx_flowcontrol_sem != NULL);
+}
+
+void umac_datapath_stad_init(struct umac_sta_data *stad)
+{
+    MMOSAL_ASSERT(stad != NULL);
+
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+
+
+    memset(sta_data->rx_seq_num_spaces, 0xff, sizeof(sta_data->rx_seq_num_spaces));
+}
+
+void umac_datapath_stad_flush_txq(struct umac_data *umacd, struct umac_sta_data *stad)
+{
+    MMOSAL_ASSERT(stad != NULL);
+    const uint16_t aid = umac_sta_data_get_aid(stad);
+    MMLOG_DBG("Flushing %d frames for STA AID=%d\n", umac_sta_data_get_queued_len(stad), aid);
+    while (umac_sta_data_get_queued_len(stad))
+    {
+        struct mmpkt *mmpkt = umac_sta_data_pop_pkt(stad);
+        MMOSAL_DEV_ASSERT(mmpkt);
+        mmpkt_release(mmpkt);
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        MMLOG_VRB("Popped and dropped packet for stad AID=%d\n", aid);
+    }
+}
+
+void umac_datapath_stad_flush(struct umac_data *umacd, struct umac_sta_data *stad)
+{
+    MMOSAL_ASSERT(stad != NULL);
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+    umac_datapath_flush_rx_reorder_list(stad, sta_data);
+    datapath_defrag_deinit(umacd, &sta_data->defrag_data);
+    umac_datapath_stad_flush_txq(umacd, stad);
+}
+
+static void umac_datapath_flush_txq(struct umac_data *umacd);
+
+static void umac_datapath_flush(struct umac_data *umacd)
+{
+    bool more = true;
+    do {
+
+        more = umac_datapath_process(umacd);
+    } while (more);
+
+    umac_stats_clear_datapath_rxq_high_water_mark(umacd);
+    umac_stats_clear_datapath_rx_mgmt_q_high_water_mark(umacd);
+    umac_stats_clear_datapath_rxq_frames_dropped(umacd);
+    umac_datapath_flush_txq(umacd);
+    umac_stats_clear_datapath_rx_reorder_overflow(umacd);
+    umac_stats_clear_datapath_rx_reorder_outdated_drops(umacd);
+    umac_stats_clear_datapath_rx_reorder_total(umacd);
+}
+
+void umac_datapath_deinit(struct umac_data *umacd)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+    umac_datapath_flush(umacd);
+
+    mmosal_semb_delete(data->tx_flowcontrol_sem);
+
+    memset(data, 0, sizeof(*data));
+}
+
+enum mmwlan_status umac_datapath_register_tx_flow_control_cb(struct umac_data *umacd,
+                                                             mmwlan_tx_flow_control_cb_t callback,
+                                                             void *arg)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+    data->tx_flow_control_callback = callback;
+    data->tx_flow_control_arg = arg;
+    return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status umac_datapath_register_rx_cb(struct umac_data *umacd,
+                                                mmwlan_rx_cb_t callback,
+                                                void *arg)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+    data->rx_pkt_callback = NULL;
+    umac_interface_register_rx_pkt_ext_cb(umacd, MMWLAN_VIF_UNSPECIFIED, NULL, NULL);
+    data->rx_callback = callback;
+    data->rx_arg = arg;
+    return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status umac_datapath_register_rx_pkt_cb(struct umac_data *umacd,
+                                                    mmwlan_rx_pkt_cb_t callback,
+                                                    void *arg)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+    data->rx_callback = NULL;
+    umac_interface_register_rx_pkt_ext_cb(umacd, MMWLAN_VIF_UNSPECIFIED, NULL, NULL);
+    data->rx_pkt_callback = callback;
+    data->rx_arg = arg;
+    return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status umac_datapath_register_rx_pkt_ext_cb(struct umac_data *umacd,
+                                                        enum mmwlan_vif vif,
+                                                        mmwlan_rx_pkt_ext_cb_t callback,
+                                                        void *arg)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+    data->rx_callback = NULL;
+    data->rx_pkt_callback = NULL;
+    data->rx_arg = NULL;
+
+    return umac_interface_register_rx_pkt_ext_cb(umacd, vif, callback, arg);
+}
+
+
+static void umac_datapath_process_rx_frame(struct umac_data *umacd,
+                                           struct umac_datapath_data *data,
+                                           struct mmpkt *rxbuf)
+{
+    struct mmpktview *rxbufview = mmpkt_open(rxbuf);
+
+
+    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    uint16_t frame_control_le = header->frame_control;
+    uint16_t frame_ver_type_subtype = dot11_frame_control_get_ver_type_subtype(frame_control_le);
+    uint16_t frame_type = dot11_frame_control_get_type(frame_control_le);
+    uint16_t frame_subtype = dot11_frame_control_get_subtype(frame_control_le);
+    MMLOG_VRB("RX frame. Type: %d, Subtype: %d.\n", frame_type, frame_subtype);
+
+    struct mmdrv_rx_metadata *metadata = mmdrv_get_rx_metadata(rxbuf);
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    if (datapath_ops == NULL)
+    {
+        MMLOG_WRN("No datapath ops for vif %u, dropping\n", vif_id);
+        mmpkt_close(&rxbufview);
+        mmpkt_release(rxbuf);
+        return;
+    }
+
+
+    const uint8_t *ta = NULL;
+    struct umac_sta_data *stad = NULL;
+    if (frame_ver_type_subtype != DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON))
+    {
+        ta = dot11_get_ta(header);
+        stad = datapath_ops->lookup_stad_by_peer_addr(umacd, ta);
+        MMOSAL_DEV_ASSERT(mm_mac_addr_is_multicast(ta) == false);
+    }
+
+
+    if (stad == NULL && umac_datapath_rx_frame_allowed_pre_association(datapath_ops,
+                                                                       frame_ver_type_subtype,
+                                                                       frame_control_le))
+    {
+
+        stad = datapath_ops->lookup_stad_by_peer_addr(umacd, NULL);
+    }
+
+    if (stad == NULL)
+    {
+        if (ta != NULL)
+        {
+            MMLOG_WRN("Unable to find STA record for " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(ta));
+        }
+        mmpkt_close(&rxbufview);
+        mmpkt_release(rxbuf);
+        return;
+    }
+
+    if (umac_sta_data_is_associated(stad))
+    {
+        bool ok = datapath_ops->update_stad_state_rx(stad, metadata, frame_control_le);
+        MMOSAL_DEV_ASSERT(ok);
+    }
+
+    if (frame_type == DOT11_FC_TYPE_DATA)
+    {
+        umac_datapath_process_rx_data_frame(umacd, stad, rxbuf, rxbufview);
+    }
+    else
+    {
+        umac_datapath_process_rx_other_frame(umacd, stad, data, rxbuf, rxbufview);
+    }
+
+}
+
+
+static inline bool umac_datapath_process_rx(struct umac_data *umacd,
+                                            struct umac_datapath_data *data)
+{
+    unsigned ii;
+    for (ii = 0; ii < MAX_RX_PROCESS_PER_LOOP; ii++)
+    {
+        struct mmpkt *mmpkt;
+        MMOSAL_TASK_ENTER_CRITICAL();
+        mmpkt = data->rx_mgmt_q.len ? mmpkt_list_dequeue(&data->rx_mgmt_q) :
+                                      mmpkt_list_dequeue(&data->rxq);
+        MMOSAL_TASK_EXIT_CRITICAL();
+
+        if (mmpkt == NULL)
+        {
+            return false;
+        }
+
+        DATAPATH_TRACE("rx deq %x", (uint32_t)mmpkt);
+
+        MMLOG_VRB("RX dequeue %p\n", mmpkt);
+        umac_datapath_process_rx_frame(umacd, data, mmpkt);
+    }
+
+    return true;
+}
+
+
+static void umac_datapath_rx_queue_frame(struct umac_data *umacd,
+                                         struct umac_datapath_data *data,
+                                         struct mmpkt *rxbuf,
+                                         struct mmpktview *rxbufview)
+{
+    MMLOG_VRB("RX queue %p\n", rxbuf);
+    DATAPATH_TRACE("rx q %x", (uint32_t)rxbuf);
+
+    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    bool is_mgmt = dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_MGMT;
+    mmpkt_close(&rxbufview);
+
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (is_mgmt)
+    {
+        mmpkt_list_append(&data->rx_mgmt_q, rxbuf);
+        umac_stats_update_datapath_rx_mgmt_q_high_water_mark(umacd, data->rx_mgmt_q.len);
+    }
+    else
+    {
+        mmpkt_list_append(&data->rxq, rxbuf);
+        umac_stats_update_datapath_rxq_high_water_mark(umacd, data->rxq.len);
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+}
+
+void umac_datapath_rx_frame(struct umac_data *umacd, struct mmpkt *rxbuf)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    struct mmpktview *rxbufview = mmpkt_open(rxbuf);
+
+    if (umac_datapath_rx_frame_preprocess(umacd, rxbufview))
+    {
+        mmpkt_close(&rxbufview);
+        mmpkt_release(rxbuf);
+        return;
+    }
+
+    umac_datapath_rx_queue_frame(umacd, data, rxbuf, rxbufview);
+    umac_health_check_note_activity(umacd);
+
+    umac_core_evt_wake(umacd);
+}
+
+struct mmpkt *umac_datapath_alloc_mmpkt_for_qos_data_tx(uint32_t payload_len, uint8_t pkt_class)
+{
+    /* +CCMP header headroom + MIC tailroom so a locally-originated mesh data frame can be host-side
+     * CCMP-encrypted in place (#P5). Harmless slack for the FW HW-crypto + non-mesh paths. */
+    return umac_datapath_alloc_raw_tx_mmpkt(pkt_class,
+                                            MAX_QOS_DATA_MAC_HEADER_LEN + DOT11_CCMP_HEADER_LEN,
+                                            payload_len + DOT11_CCMP_256_MIC_LEN);
+}
+
+struct mmpkt *mmwlan_alloc_mmpkt_for_tx(uint32_t payload_len, uint8_t tid)
+{
+    if (tid > MMWLAN_MAX_QOS_TID)
+    {
+        MMLOG_ERR("Invalid TID %u\n", tid);
+        return NULL;
+    }
+    return umac_datapath_alloc_mmpkt_for_qos_data_tx(payload_len, MMDRV_PKT_CLASS_DATA_TID0 + tid);
+}
+
+struct mmpkt *umac_datapath_alloc_raw_tx_mmpkt(uint8_t pkt_class,
+                                               uint32_t space_at_start,
+                                               uint32_t space_at_end)
+{
+    return mmdrv_alloc_mmpkt_for_tx(pkt_class, space_at_start, space_at_end);
+}
+
+struct mmpkt *umac_datapath_copy_tx_mmpkt(struct mmpkt *pkt, uint8_t pkt_class)
+{
+    uint32_t length;
+    struct mmpkt *copy;
+    struct mmpktview *view_src;
+    struct mmpktview *view_dst;
+
+    MMOSAL_DEV_ASSERT(pkt != NULL);
+
+    view_src = mmpkt_open(pkt);
+    length = mmpkt_get_data_length(view_src);
+
+    copy = umac_datapath_alloc_mmpkt_for_qos_data_tx(length, pkt_class);
+    if (copy == NULL)
+    {
+        mmpkt_close(&view_src);
+        return NULL;
+    }
+
+    view_dst = mmpkt_open(copy);
+    mmpkt_append_data(view_dst, mmpkt_get_data_start(view_src), length);
+    *(mmpkt_get_metadata(copy).tx) = *(mmpkt_get_metadata(pkt).tx);
+
+    mmpkt_close(&view_src);
+    mmpkt_close(&view_dst);
+
+    return copy;
+}
+
+static void umac_datapath_aggr_check(struct umac_data *umacd,
+                                     struct umac_sta_data *stad,
+                                     const struct umac_datapath_ops *datapath_ops,
+                                     uint8_t tid,
+                                     uint16_t ssc)
+{
+    if (tid > UMAC_BA_MAX_AGGR_TID)
+    {
+        return;
+    }
+
+    if (datapath_ops->get_sta_state(stad) != MMWLAN_STA_CONNECTED)
+    {
+        return;
+    }
+
+    if (!umac_config_is_ampdu_enabled(umacd) ||
+        !MORSE_CAP_SUPPORTED(umac_interface_get_capabilities(umacd), AMPDU))
+    {
+        return;
+    }
+
+    umac_ba_session_init(stad, tid, ssc, DOT11_BLOCK_ACK_TIMEOUT_DISABLED);
+}
+
+/* D1 (follow-Linux mesh_nexthop_resolve, mesh_hwmp.c): a mesh UNICAST DATA frame whose destination has
+ * no resolved HWMP path AND is not a direct peer is undeliverable right now. Linux buffers it + issues a
+ * PREQ; we have no mesh pending queue, so we DROP it and kick discovery — instead of the old fallback that
+ * transmitted RA=destination (only correct for a direct peer; for a multi-hop-only dest it wastes airtime
+ * on an unreachable RA + loses first packets). EAPOL (peering) and group/multicast are never dropped here.
+ * Side effect: kicks (rate-limited) path discovery when it returns true, so subsequent frames resolve. */
+/* S5c round-trip — a mesh node's own unicast to a dst with no mesh path but that is a KNOWN off-mesh host
+ * (in the MPP table, i.e. reachable via a gate) is PROXIED into the mesh as an AE frame toward its gate,
+ * instead of being dropped: eaddr1 = the dst (off-mesh), eaddr2 = us (the source). The frame is
+ * [802.3 hdr][L3]; re-encapsulate the L3 as [LLC/SNAP][L3] for mmwlan_mesh_tx_proxied. Only fires for an
+ * MPP-known dst — a plain (undiscovered) mesh dst is NOT proxied (it falls through to discovery). */
+static bool umac_datapath_mesh_proxy_offmesh(const struct umac_8023_hdr *h8023, struct mmpktview *txbufview)
+{
+    if (txbufview == NULL || !mmwlan_mesh_mpp_lookup(h8023->dest_addr, NULL))
+    {
+        return false; /* not a known off-mesh host — let discovery handle it (it may be a mesh node) */
+    }
+    const uint8_t *frame = (const uint8_t *)mmpkt_get_data_start(txbufview);
+    uint32_t flen = mmpkt_get_data_length(txbufview);
+    if (frame == NULL || flen < sizeof(struct umac_8023_hdr))
+    {
+        return false;
+    }
+    uint32_t l3 = flen - sizeof(struct umac_8023_hdr);
+    /* Scratch to prepend an 8-byte LLC/SNAP to the L3 before mmwlan_mesh_tx_proxied copies it. It is
+     * `static` (not a ~1.5 KB stack frame) and safe because umac_datapath_process_tx_frame runs only on the
+     * single umac datapath context — the same single-event-loop, no-concurrent-writers invariant the mesh
+     * path/RMC/MPP tables rely on. It is written then consumed synchronously within this call, so it is not
+     * a persistent global. If TX is ever driven from a second context this must become per-call. */
+    static uint8_t snap_l3[sizeof(snap_802_1h) + 2 + 1514];
+    if (l3 > sizeof(snap_l3) - sizeof(snap_802_1h) - 2)
+    {
+        return false;
+    }
+    memcpy(snap_l3, snap_802_1h, sizeof(snap_802_1h)); /* aa aa 03 00 00 00 */
+    snap_l3[6] = frame[12];                             /* ethertype (BE) from the 802.3 header */
+    snap_l3[7] = frame[13];
+    memcpy(snap_l3 + 8, frame + sizeof(struct umac_8023_hdr), l3);
+    /* final_dst = the 802.3 dst (the off-mesh host); src = the 802.3 src (us). */
+    return mmwlan_mesh_tx_proxied(frame, frame + DOT11_MAC_ADDR_LEN, snap_l3, 8 + l3);
+}
+
+static bool umac_datapath_mesh_frame_undeliverable(const struct umac_8023_hdr *h8023, bool is_eapol,
+                                                   struct mmpktview *txbufview)
+{
+    if (is_eapol || mm_mac_addr_is_multicast(h8023->dest_addr))
+    {
+        return false;
+    }
+    uint8_t next_hop[DOT11_MAC_ADDR_LEN];
+    if (umac_mesh_lookup_next_hop(h8023->dest_addr, next_hop))
+    {
+        return false; /* a multi-hop path is resolved */
+    }
+    if (umac_mesh_get_peer_stad(h8023->dest_addr) != NULL)
+    {
+        return false; /* dest is a direct peer -> RA=dest is correct (single-hop, no path needed) */
+    }
+    /* S5c — no mesh path. If the dst is a known off-mesh host (MPP), proxy it via the gate (re-sent as an
+     * AE frame); the original is dropped either way. Otherwise kick discovery (it may be a mesh node). */
+    if (umac_datapath_mesh_proxy_offmesh(h8023, txbufview))
+    {
+        return true; /* proxied -> drop the original (already re-originated as AE) */
+    }
+    umac_mesh_start_discovery(h8023->dest_addr);
+    return true;
+}
+
+enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
+                                                  struct umac_sta_data *stad,
+                                                  struct mmpktview *txbufview)
+{
+    struct mmpkt *txbuf = mmpkt_from_view(txbufview);
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
+    uint16_t tid = tx_metadata->tid;
+    uint8_t enc = tx_metadata->enc;
+    const struct umac_8023_hdr *header_8023 =
+        (const struct umac_8023_hdr *)mmpkt_get_data_start(txbufview);
+    const uint16_t ethertype = be16toh(header_8023->ethertype_be);
+    struct dot11_data_hdr data_hdr = { 0 };
+    struct dot11_hdr *header = &data_hdr.base;
+    int key_id = -1;
+    int key_len = 0;
+    int ccmp_len = 0;
+    uint32_t rts_threshold = 0;
+    bool rts_required = false;
+    struct dot11_qos_ctrl qos_ctrl = {};
+    enum mmwlan_status status = MMWLAN_ERROR;
+
+    bool is_eapol = (ethertype == ETHERTYPE_EAPOL);
+
+    MMLOG_DBG("Dequeued frame for TX (%p, ethertype=0x%04x, tid=%u, %s port)\n",
+              txbuf,
+              ethertype,
+              tid,
+              is_eapol ? "uncontrolled" : "controlled");
+
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops == NULL)
+    {
+        status = MMWLAN_ERROR;
+        goto error;
+    }
+
+    /* Egress framing follows the per-vif ops (STA/AP/MESH). Compute the mesh discriminator once;
+     * the Mesh Control insertion, next-hop keying, BA session and SW-CCMP paths below all key off
+     * it (replaces the old global umac_mesh_is_active() / gateway test). */
+    const bool tx_is_mesh_frame = (datapath_ops == umac_datapath_ops_mesh);
+    if (tx_is_mesh_frame && umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol, txbufview))
+    {
+        /* D1: dropped pending HWMP path discovery; counted like any other TX drop. SUCCESS (not
+         * ERROR): the frame is deliberately consumed while discovery is in flight, not a failure
+         * the caller can retry differently. */
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        status = MMWLAN_SUCCESS;
+        goto error;
+    }
+
+    datapath_ops->construct_80211_data_header(stad, header_8023, &data_hdr);
+    const uint32_t data_hdr_len = dot11_data_hdr_get_len(&data_hdr);
+
+
+    mmpkt_remove_from_start(txbufview, 2 * DOT11_MAC_ADDR_LEN);
+    MM_STATIC_ASSERT(2 * DOT11_MAC_ADDR_LEN == offsetof(struct umac_8023_hdr, ethertype_be), "");
+
+    if (ethertype >= ETHERTYPE_THRESHOLD)
+    {
+
+        mmpkt_prepend_data(txbufview, snap_802_1h, sizeof(snap_802_1h));
+    }
+
+    /* 802.11s Mesh Control header — sits between the QoS Control field and the payload
+     * (mirrors net/mac80211 ieee80211_new_mesh_header; verified against an on-air capture).
+     * 6 bytes for a locally-originated frame, no address extension: Mesh Flags=0, TTL, seqnum.
+     * The QoS "Mesh Control Present" bit is set below. Gated on the frame's egress vif being
+     * MESH (tx_is_mesh_frame) so a concurrent AP's downlink is NOT given a mesh header. */
+    if (tx_is_mesh_frame)
+    {
+        uint8_t mesh_ctrl[6];
+        mesh_ctrl[0] = 0;  /* Mesh Flags: no address extension */
+        mesh_ctrl[1] = 31; /* Mesh TTL (dot11MeshTTL default) */
+        uint32_t mesh_sn = htole32(umac_mesh_next_seqnum());
+        memcpy(&mesh_ctrl[2], &mesh_sn, sizeof(mesh_sn));
+        mmpkt_prepend_data(txbufview, mesh_ctrl, sizeof(mesh_ctrl));
+    }
+
+    const uint8_t *ra = dot11_get_ra(&(data_hdr.base));
+    if (mm_mac_addr_is_zero(ra))
+    {
+        MMLOG_WRN("Dropping tx data frame with zero RA.\n");
+        status = MMWLAN_ERROR;
+        goto error;
+    }
+    bool is_multicast = mm_mac_addr_is_multicast(ra);
+
+    /* A locally-originated mesh UNICAST to a multi-hop destination is dequeued on the common_stad, which
+     * only carries the vestigial static fallback MTK (mesh_p1_mtk). It must instead be CCMP-keyed under
+     * the NEXT-HOP peer's per-pair MTK — RA is the HWMP next hop (set by the mesh data-header builder),
+     * and that next hop decrypts under the real per-pair MTK, so keying off the common_stad fails the MIC
+     * and the reply is dropped (the multi-hop relay break). Mirrors the forward path keying under the
+     * next hop (umac_mesh_forward_data). Single-hop dest: the frame is already on the peer stad, so this
+     * resolves back to `stad`. Group TX stays on the common_stad's own MGTK. */
+    struct umac_sta_data *key_stad = stad;
+    if (tx_is_mesh_frame && !is_multicast)
+    {
+        struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(ra);
+        if (nh_stad != NULL)
+        {
+            key_stad = nh_stad;
+        }
+    }
+
+    /* Sequence-number space + Block Ack / A-MPDU eligibility follow the NEXT-HOP peer (key_stad), not the
+     * dequeue stad. For a multi-hop local-origin unicast the frame is dequeued on the common_stad, but the
+     * per-link BA session, the next hop's reorder window, and the 802.11 QoS-data seqno must all key on the
+     * next hop (RA). Mirrors net/mac80211 ieee80211_tx_h_sequence: hdr->seq_ctrl is stamped from
+     * tx->sta->tid_seq[tid] with tx->sta = sta_info_get(addr1 = mpath->next_hop) (per-next-hop-peer, per-TID
+     * counter — NOT per-vif, NOT per-final-dest). Because A2/TA is always our own mesh MAC, the next hop keys
+     * its reorder scoreboard on (our-MAC, TID); a counter shared across next hops (or single-hop-to-P mixed
+     * with multi-hop-via-P) would feed one (TA,TID) window two seq spaces and corrupt reordering. key_stad ==
+     * stad for single-hop / non-mesh / multicast, so this is a no-op off the multi-hop mesh path. */
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(key_stad);
+    MMOSAL_DEV_ASSERT(!mm_mac_addr_is_zero(dot11_get_ta(&(data_hdr.base))));
+    MMOSAL_DEV_ASSERT(!mm_mac_addr_is_zero(dot11_get_da(&(data_hdr.base))));
+    MMOSAL_DEV_ASSERT(!mm_mac_addr_is_zero(dot11_get_sa_data(&data_hdr)));
+
+
+    MMOSAL_DEV_ASSERT(is_eapol || enc == ENCRYPTION_ENABLED);
+
+    if (umac_sta_data_get_security_type(stad) != MMWLAN_OPEN && enc != ENCRYPTION_DISABLED)
+    {
+        enum umac_key_type key_type = is_multicast ? UMAC_KEY_TYPE_GROUP : UMAC_KEY_TYPE_PAIRWISE;
+
+        key_id = umac_keys_get_active_key_id(key_stad, key_type);
+        if (key_id >= 0)
+        {
+            key_len = umac_keys_get_key_len(key_stad, key_id);
+            header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
+        }
+        else if (enc == ENCRYPTION_ENABLED)
+        {
+            MMLOG_WRN("Could not find key for type %u.\n", key_type);
+            status = MMWLAN_ERROR;
+            goto error;
+        }
+        MMLOG_DBG("Using %s key index %d\n",
+                  (key_type == UMAC_KEY_TYPE_GROUP)    ? "GROUP" :
+                  (key_type == UMAC_KEY_TYPE_PAIRWISE) ? "PAIR" :
+                                                         "??",
+                  key_id);
+    }
+
+    size_t seq_num_idx = is_multicast ? MMDRV_SEQ_NUM_BASELINE : tid;
+    DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(header->sequence_control,
+                                               sta_data->tx_seq_num_spaces[seq_num_idx]++);
+
+
+    if (!is_multicast && !is_eapol)
+    {
+        /* key_stad, not stad: open the originator BA session on the next-hop peer (multi-hop mesh
+         * origin) so ADDBA is addressed to the real next hop; key_stad == stad off that path. */
+        umac_datapath_aggr_check(umacd, key_stad, datapath_ops, tid, header->sequence_control);
+    }
+
+    rts_threshold = umac_config_get_rts_threshold(umacd);
+
+
+    qos_ctrl.field = (uint16_t)(tid & DOT11_MASK_QC_TID);
+    if (tx_is_mesh_frame)
+    {
+        qos_ctrl.field |= 0x0100u; /* Mesh Control Present (802.11s QoS Control bit 8) */
+        if (is_multicast)
+        {
+            /* Ack Policy "No Ack" (bits 5-6 = 01) — group-addressed frames are never acked,
+             * matching mac80211's QoS ack policy for a multicast RA. */
+            qos_ctrl.field |= 0x0020u;
+        }
+    }
+
+    if (key_len == UMAC_KEY_AES_256_LEN)
+    {
+        ccmp_len = DOT11_CCMP_HEADER_LEN + DOT11_CCMP_256_MIC_LEN;
+    }
+    else if (key_len == UMAC_KEY_AES_128_LEN)
+    {
+        ccmp_len = DOT11_CCMP_HEADER_LEN + DOT11_CCMP_128_MIC_LEN;
+    }
+
+    rts_required = (rts_threshold && ((mmpkt_get_data_length(txbufview) +
+                                       data_hdr_len +
+                                       sizeof(qos_ctrl) +
+                                       DOT11_FCS_FIELD_LEN +
+                                       ccmp_len) > rts_threshold));
+
+
+    MMLOG_VRB("Add QOS CNTL bytes\n");
+    mmpkt_prepend_data(txbufview, (uint8_t *)&qos_ctrl.field, sizeof(qos_ctrl));
+    mmpkt_prepend_data(txbufview, (uint8_t *)&data_hdr, data_hdr_len);
+
+    tx_metadata->flags = 0;
+    if (key_id >= 0)
+    {
+        /* #P5c — locally-originated mesh data: encrypt on the host (FW has no key). Otherwise FW HW.
+         * Keyed on the frame's egress vif (tx_is_mesh_frame) so a concurrent AP's downlink uses HW
+         * crypto (A2=BSSID, no mesh SW-CCMP) even while a mesh is active. */
+        if (tx_is_mesh_frame && umac_mesh_sw_crypto_enabled())
+        {
+            enum umac_key_type key_type = is_multicast ? UMAC_KEY_TYPE_GROUP : UMAC_KEY_TYPE_PAIRWISE;
+            umac_keys_increment_tx_seq(key_stad, key_id);
+            if (!umac_datapath_sw_ccmp_encrypt(key_stad, txbufview, key_type, key_id))
+            {
+                status = MMWLAN_ERROR;
+                goto error;
+            }
+        }
+        else
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+            umac_keys_increment_tx_seq(key_stad, key_id);
+        }
+    }
+
+    tx_metadata->key_idx = key_id;
+
+    if (!is_multicast)
+    {
+        /* key_stad: read the reorder-window bound + AMPDU-permitted flag from the next-hop peer's BA
+         * session (where aggr_check opened it), so a multi-hop origin's frames are marked A-MPDU-eligible.
+         * key_stad == stad off the multi-hop mesh path. */
+        tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(key_stad, tid);
+        if (umac_ba_is_ampdu_permitted(key_stad, tid))
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_AMPDU_ENABLED;
+        }
+    }
+
+    umac_connection_populate_tx_metadata(umacd, tx_metadata);
+
+    /* aid + rate control follow the NEXT-HOP peer (key_stad), not the dequeue stad. A multi-hop mesh
+     * origin unicast is dequeued on the common_stad (chronite/final-dest is not a direct peer), whose
+     * aid/rate table is the untrained MBSS default (~MCS0). The frame is actually a unicast to the next
+     * hop (A1 = key_stad), so both the AID the FW indexes its per-STA TX context by AND the rate table
+     * must be the next hop's trained values. Keeping them on common_stad sent multi-hop frames at MCS0,
+     * where a full-size (~1500 B) 4-addr frame exceeds the 1 MHz max PPDU -> the FW FRAGMENTS it (sets
+     * moreFrag) AFTER the host SW-CCMP MIC is computed over the unfragmented FC -> the next hop MIC-fails
+     * ~99.6% (the S3 relay-forward drop; dual-side CCMP capture: key+nonce identical, FC 0x8843->0x8847).
+     * Completes the S2 "frame follows the next hop" fix (seqno/BA/reorder already key on key_stad, :2209-
+     * 2246/:2314). Mirrors net/mac80211: tx->sta = sta_info_get(addr1 = mpath->next_hop) drives rate
+     * control (rate_control_get_rate) + the per-STA TX context. key_stad == stad off the multi-hop mesh
+     * path, so single-hop / non-mesh / multicast are byte-identical (no-op). */
+    tx_metadata->aid = umac_sta_data_get_aid(key_stad);
+
+
+    if (is_eapol)
+    {
+        umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+    }
+    else if (is_multicast)
+    {
+
+        tx_metadata->flags |= MMDRV_TX_FLAG_NO_ACK;
+        umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+    }
+    else
+    {
+        MMOSAL_DEV_ASSERT(key_stad != NULL);
+        umac_rc_init_rate_table_data(key_stad,
+                                     &tx_metadata->rc_data,
+                                     rts_required,
+                                     mmpkt_get_data_length(txbufview));
+    }
+
+    MMLOG_DBG("Transmitting frame %p\n", txbuf);
+
+    umac_stats_update_last_tx_time(umacd);
+
+    mmpkt_close(&txbufview);
+    status = mmdrv_tx_frame(txbuf, false);
+    if (status != MMWLAN_SUCCESS)
+    {
+        MMLOG_WRN("mmdrv_tx_frame failed (%u)\n", status);
+    }
+    return status;
+
+error:
+    mmpkt_close(&txbufview);
+    mmpkt_release(txbuf);
+    umac_stats_increment_datapath_txq_frames_dropped(umacd);
+    return status;
+}
+
+static uint32_t umac_datapath_calculate_tx_timeout_ms(struct umac_data *umacd, bool blocking)
+{
+    if (blocking)
+    {
+        const struct mmwlan_twt_config_args *twt_config = umac_twt_get_config(umacd);
+        if (twt_config->twt_mode == MMWLAN_TWT_REQUESTER)
+        {
+            return (twt_config->twt_wake_interval_us / 1000);
+        }
+        else
+        {
+            return MMWLAN_TX_DEFAULT_TIMEOUT_MS;
+        }
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+
+enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
+                                          struct mmpkt *txbuf,
+                                          enum umac_datapath_frame_encryption enc,
+                                          const uint8_t *ra)
+{
+    enum mmwlan_status status = MMWLAN_ERROR;
+    struct mmpktview *txbufview = mmpkt_open(txbuf);
+    const struct umac_8023_hdr *header_8023 =
+        (const struct umac_8023_hdr *)mmpkt_get_data_start(txbufview);
+
+    if (mmpkt_get_data_length(txbufview) < sizeof(*header_8023))
+    {
+        MMLOG_WRN("Tx len is too small %lu\n", mmpkt_get_data_length(txbufview));
+        status = MMWLAN_ERROR;
+        goto drop;
+    }
+
+    if (mm_mac_addr_is_zero(header_8023->dest_addr) || mm_mac_addr_is_zero(header_8023->src_addr))
+    {
+        MMLOG_WRN("Invalid Source or Destination Address\n");
+        status = MMWLAN_INVALID_ARGUMENT;
+        goto drop;
+    }
+
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+    if (datapath_ops == NULL)
+    {
+        MMLOG_WRN("Invalid datapath_ops for vif_id %u\n", tx_metadata->vif_id);
+        status = MMWLAN_UNAVAILABLE;
+        goto drop;
+    }
+
+    struct umac_sta_data *stad = NULL;
+    const char *addr_type;
+    const uint8_t *addr;
+    if (ra == NULL)
+    {
+        stad = datapath_ops->lookup_stad_by_tx_dest_addr(umacd, header_8023->dest_addr);
+        addr_type = "DA";
+        addr = header_8023->dest_addr;
+    }
+    else
+    {
+        stad = datapath_ops->lookup_stad_by_peer_addr(umacd, ra);
+        addr_type = "RA";
+        addr = ra;
+    }
+
+    if (stad == NULL)
+    {
+        MMLOG_WRN("No STA record for %s " MM_MAC_ADDR_FMT "\n", addr_type, MM_MAC_ADDR_VAL(addr));
+        status = MMWLAN_NOT_FOUND;
+        goto drop;
+    }
+
+    if (mm_mac_addr_is_zero(umac_sta_data_peek_bssid(stad)))
+    {
+        MMLOG_WRN("Uninitialised STA record for " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(addr));
+        status = MMWLAN_NOT_FOUND;
+        goto drop;
+    }
+
+    const uint16_t ethertype = be16toh(header_8023->ethertype_be);
+    const bool is_eapol = (ethertype == ETHERTYPE_EAPOL);
+    if (enc == ENCRYPTION_DISABLED && !is_eapol)
+    {
+        MMLOG_WRN(
+            "Dropping request to TX non-EAPOL frame with encryption disabled (ethertype=0x%04x)\n",
+            ethertype);
+        status = MMWLAN_INVALID_ARGUMENT;
+        goto drop;
+    }
+
+    tx_metadata->enc = is_eapol ? enc : ENCRYPTION_ENABLED;
+
+    if (is_eapol && !datapath_ops->is_stad_tx_paused(stad))
+    {
+
+        return umac_datapath_process_tx_frame(umacd, stad, txbufview);
+    }
+
+    enum mmwlan_sta_state sta_state = datapath_ops->get_sta_state(stad);
+    if (sta_state != MMWLAN_STA_CONNECTED)
+    {
+
+        MMLOG_WRN("Dropping request to TX frame when not connected (AID: %u, STATE: %s)\n",
+                  umac_sta_data_get_aid(stad),
+                  sta_state == MMWLAN_STA_DISABLED ? "disabled" : "connecting");
+        status = MMWLAN_UNAVAILABLE;
+        goto drop;
+    }
+
+    mmpkt_close(&txbufview);
+    datapath_ops->enqueue_tx_frame(umacd, stad, txbuf);
+    MMLOG_DBG("Queued frame for TX (%p, ethertype=0x%04x, enc=0x%x)\n", txbuf, ethertype, enc);
+    umac_core_evt_wake(umacd);
+    return MMWLAN_SUCCESS;
+
+drop:
+    mmpkt_close(&txbufview);
+    mmpkt_release(txbuf);
+    return status;
+}
+
+static bool umac_datapath_dequeue_tx_frame(struct umac_data *umacd,
+                                           struct umac_sta_data **stad,
+                                           struct mmpkt **txbuf)
+{
+
+    const struct umac_datapath_ops *datapath_ops;
+
+    datapath_ops = umac_interface_get_datapath_ops(umacd, MMWLAN_VIF_STA);
+    if (datapath_ops != NULL)
+    {
+        bool has_more = datapath_ops->dequeue_tx_frame(umacd, stad, txbuf);
+        if (*txbuf != NULL)
+        {
+            return has_more;
+        }
+    }
+
+    datapath_ops = umac_interface_get_datapath_ops(umacd, MMWLAN_VIF_AP);
+    if (datapath_ops != NULL)
+    {
+        bool has_more = datapath_ops->dequeue_tx_frame(umacd, stad, txbuf);
+        if (*txbuf != NULL)
+        {
+            return has_more;
+        }
+    }
+
+    return false;
+}
+
+
+static inline bool umac_datapath_process_tx(struct umac_data *umacd,
+                                            struct umac_datapath_data *data)
+{
+    bool has_more = false;
+    for (unsigned ii = 0; ii < MAX_TX_PROCESS_PER_LOOP; ii++)
+    {
+
+        if (umac_datapath_tx_is_paused(data, ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM))
+        {
+            MMLOG_DBG("TX datapath blocked.\n");
+            return false;
+        }
+
+        struct mmpkt *mmpkt = NULL;
+        struct umac_sta_data *stad = NULL;
+        has_more = umac_datapath_dequeue_tx_frame(umacd, &stad, &mmpkt);
+
+        if (mmpkt == NULL)
+        {
+            return false;
+        }
+        MMOSAL_ASSERT(stad != NULL);
+        DATAPATH_TRACE("tx deq %x", (uint32_t)mmpkt);
+
+        const struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
+
+        MMLOG_VRB("TX dequeue %p for AID %u, VIF %u\n",
+                  mmpkt,
+                  umac_sta_data_get_aid(stad),
+                  tx_metadata->vif_id);
+
+        umac_datapath_process_tx_frame(umacd, stad, mmpkt_open(mmpkt));
+    }
+    return has_more;
+}
+
+static void umac_datapath_flush_txq(struct umac_data *umacd)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    bool more = true;
+    do {
+
+        more = umac_datapath_process_tx(umacd, data);
+    } while (more);
+
+    umac_stats_clear_datapath_txq_high_water_mark(umacd);
+    umac_stats_clear_datapath_txq_frames_dropped(umacd);
+}
+
+enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struct mmpkt *txbuf)
+{
+    enum mmwlan_status status;
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+    struct mmpktview *txbufview = mmpkt_open(txbuf);
+    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(txbufview);
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
+    uint32_t timeout_ms;
+    uint16_t pause_mask;
+
+    uint8_t seq_num_space = MMDRV_SEQ_NUM_BASELINE;
+
+    MMOSAL_DEV_ASSERT(stad != NULL);
+    MMOSAL_DEV_ASSERT(tx_metadata != NULL);
+
+    tx_metadata->vif_id = umac_sta_data_get_vif_id(stad);
+
+    bool is_probe_request =
+        (dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_MGMT) &&
+        (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_PROBE_REQ);
+    DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(header->sequence_control,
+                                               sta_data->tx_seq_num_spaces[seq_num_space]++);
+
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops == NULL)
+    {
+        MMLOG_WRN("No datapath ops for vif %u", tx_metadata->vif_id);
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        return MMWLAN_ERROR;
+    }
+
+    int key_id = -1;
+    if ((tx_metadata->enc != ENCRYPTION_DISABLED) &&
+        (datapath_ops->get_sta_state(stad) == MMWLAN_STA_CONNECTED))
+    {
+
+        /* A group-addressed Mesh/Multihop Action frame (HWMP PREQ/PERR/RANN) is a group-privacy
+         * action (frame_is_group_privacy_action / mac80211 _ieee80211_is_group_privacy_action): in a
+         * mesh it is sent UNPROTECTED (mesh peers are MFP=no — net/mac80211 transmits group HWMP in the
+         * clear), and the peer accepts it (the RX mirror of this exemption). So skip the robust-mgmt
+         * handling entirely and let it go out unprotected, instead of the BC/MC RMF drop below (which is
+         * the infra BIP case). This is the TX counterpart of the #18 RX exemption and supersedes the
+         * #17 workaround of MGTK-encrypting the broadcast HWMP (which a cross-vendor relay can't
+         * decrypt as group management). Unicast HWMP (PREP) is NOT exempt — it stays pairwise-encrypted. */
+        if (umac_sta_data_pmf_is_required(stad) && frame_is_robust_mgmt(txbufview) &&
+            !frame_is_group_privacy_action(txbufview))
+        {
+
+            if (!mm_mac_addr_is_multicast(dot11_get_da(header)))
+            {
+                header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
+                key_id = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
+                if (key_id >= 0)
+                {
+                    umac_keys_increment_tx_seq(stad, key_id);
+                }
+                else
+                {
+                    MMLOG_WRN("Dropping frame, no key to encrypt protected management frame\n");
+                    mmpkt_close(&txbufview);
+                    mmpkt_release(txbuf);
+                    return MMWLAN_ERROR;
+                }
+            }
+        }
+    }
+
+    tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    if (key_id >= 0)
+    {
+        /* #P5c — a protected unicast mesh action frame (e.g. unicast PREP under the pairwise MTK):
+         * encrypt on the host. The PN was already incremented in the key-setup above. */
+        if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
+        {
+            if (!umac_datapath_sw_ccmp_encrypt(stad, txbufview, UMAC_KEY_TYPE_PAIRWISE, key_id))
+            {
+                mmpkt_close(&txbufview);
+                mmpkt_release(txbuf);
+                umac_stats_increment_datapath_txq_frames_dropped(umacd);
+                return MMWLAN_ERROR;
+            }
+        }
+        else
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+            tx_metadata->key_idx = key_id;
+        }
+    }
+
+    tx_metadata->tid = MMWLAN_MAX_QOS_TID;
+    tx_metadata->aid = umac_sta_data_get_aid(stad);
+
+    umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+
+
+    pause_mask = ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM;
+    if (is_probe_request)
+    {
+        pause_mask &= ~UMAC_DATAPATH_PAUSE_SOURCE_SCAN;
+    }
+
+    timeout_ms = umac_datapath_calculate_tx_timeout_ms(umacd, true);
+    status = umac_datapath_wait_for_tx_ready_(data, timeout_ms, pause_mask);
+    if (status != MMWLAN_SUCCESS)
+    {
+        MMLOG_WRN("Tx Datapath Blocked (is_probe_request=%d)\n", is_probe_request);
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        return status;
+    }
+
+    umac_stats_update_last_tx_time(umacd);
+
+    mmpkt_close(&txbufview);
+    status = mmdrv_tx_frame(txbuf, true);
+    if (status != MMWLAN_SUCCESS)
+    {
+        return status;
+    }
+
+    return MMWLAN_SUCCESS;
+}
+
+/* Send a pre-built mesh DATA frame on the *data-path* rule. umac_datapath_tx_mgmt_frame can't be
+ * reused: its encryption path is for robust *management* frames (PMF/pairwise) and it overwrites the
+ * tx metadata, so a forwarded data frame goes out in the clear. This applies the data-path rule
+ * instead — when the stad's security != OPEN, encrypt under `key_type` on `stad` and set
+ * Protected/HW_ENC + the data-path PN. Two callers, mirroring net/mac80211 ieee80211_tx_h_select_key
+ * (tx.c:614): a re-broadcast GROUP frame uses the forwarder's own MGTK on the common stad (== the
+ * GTK for a multicast frame); a forwarded UNICAST frame uses the NEXT HOP's pairwise MTK on its
+ * per-peer stad (== tx->sta->ptk for a unicast frame). The 802.11 header + Mesh Control + payload
+ * are already built; the firmware inserts the CCMP header for HW_ENC frames. */
+static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data *stad,
+                                                            struct mmpkt *txbuf,
+                                                            enum umac_key_type key_type)
+{
+    enum mmwlan_status status;
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+    struct mmpktview *txbufview = mmpkt_open(txbuf);
+    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(txbufview);
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
+
+    /* S3 (relay onto the aggregation-eligible data path, blocker B6). A forwarded UNICAST (key_type ==
+     * PAIRWISE, from umac_datapath_tx_mesh_unicast_frame) rides the next hop's per-TID QoS-data seqno
+     * space and opens a BA session on the next hop, so the FW A-MPDUs it — mirroring the local-origin
+     * path (:2209-2219). A re-broadcast GROUP (key_type == GROUP) stays on the baseline seqno space and
+     * never aggregates (No-Ack multicast). `stad` is already the next-hop peer for a forwarded unicast. */
+#if MESH_FWD_DATA_AGGREGATE
+    bool fwd_aggregate = (key_type == UMAC_KEY_TYPE_PAIRWISE);
+#else
+    bool fwd_aggregate = false;
+#endif
+    uint8_t fwd_tid = fwd_aggregate ? (uint8_t)MESH_FWD_TID : (uint8_t)MMWLAN_MAX_QOS_TID;
+    size_t seq_idx = fwd_aggregate ? (size_t)MESH_FWD_TID : (size_t)MMDRV_SEQ_NUM_BASELINE;
+
+    /* Wait for TX headroom BEFORE the seqno stamp / aggr_check below, so a paused forward never stamps a
+     * next-hop seqno it won't transmit (A-MPDU reorder gap) and never reaches aggr_check while paused.
+     * NB (2026-07-12 bench): the "relay interrupt-WDT crash" this originally tried to dodge with a
+     * timeout=0 drop-on-full is a board0-WIRING artifact (no WAKE/BUSY), NOT a software stall — a
+     * fully-wired relay (board2) never crashes. And timeout=0 was far too aggressive: it dropped ~every
+     * forward on any transient pause (board2 forwarded ~0/733). So use a bounded wait: lets a transient
+     * pause clear (the forward actually goes out + can aggregate) while capping the evtloop stall well
+     * under the interrupt-WDT window. See docs/reference/rimba-bench-devices.md + the S3 worklog. */
+    uint16_t pause_mask = ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM;
+    status = umac_datapath_wait_for_tx_ready_(data, MESH_FWD_TX_TIMEOUT_MS, pause_mask);
+    if (status != MMWLAN_SUCCESS)
+    {
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        return status;
+    }
+
+    DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(header->sequence_control,
+                                               sta_data->tx_seq_num_spaces[seq_idx]++);
+
+    if (fwd_aggregate)
+    {
+        /* Forwarded frame is a mesh frame; open the BA session under the mesh ops. */
+        umac_datapath_aggr_check(umacd, stad, umac_datapath_ops_mesh, fwd_tid,
+                                 header->sequence_control);
+    }
+
+    int key_id = -1;
+    if (umac_sta_data_get_security_type(stad) != MMWLAN_OPEN)
+    {
+        key_id = umac_keys_get_active_key_id(stad, key_type);
+        if (key_id >= 0)
+        {
+            header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
+        }
+        else
+        {
+            MMLOG_WRN("MESH forward: no %s key installed, sending in the clear\n",
+                      key_type == UMAC_KEY_TYPE_GROUP ? "group" : "pairwise");
+        }
+    }
+
+    tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    if (key_id >= 0)
+    {
+        /* #P5c — forwarded unicast (next-hop MTK) / re-broadcast group (own MGTK): encrypt on the host
+         * so a forwarded A4!=TA frame (which the FW withholds in HW-crypto mode, #20) is protected
+         * end-to-end. Otherwise FW HW. */
+        if (umac_mesh_sw_crypto_enabled())
+        {
+            umac_keys_increment_tx_seq(stad, key_id);
+            if (!umac_datapath_sw_ccmp_encrypt(stad, txbufview, key_type, key_id))
+            {
+                mmpkt_close(&txbufview);
+                mmpkt_release(txbuf);
+                umac_stats_increment_datapath_txq_frames_dropped(umacd);
+                return MMWLAN_ERROR;
+            }
+        }
+        else
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+            tx_metadata->key_idx = key_id;
+            umac_keys_increment_tx_seq(stad, key_id);
+        }
+    }
+    tx_metadata->tid = fwd_tid;
+    /* S3 — mark the forwarded unicast A-MPDU-eligible from the next hop's BA session (where aggr_check
+     * opened it), mirroring the local-origin path (:2287-2292). Group re-broadcast stays non-aggregated. */
+    if (fwd_aggregate)
+    {
+        tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, fwd_tid);
+        if (umac_ba_is_ampdu_permitted(stad, fwd_tid))
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_AMPDU_ENABLED;
+        }
+    }
+    tx_metadata->aid = umac_sta_data_get_aid(stad);
+    /* P6c real-RC (Edit 2b): sample the peer's learned data rates on the forward path (mirrors the
+     * local-origin path :2240), so a relay-dominated node trains mmrc instead of only feeding MCS0.
+     * Falls back to the mgmt table until RC is started on this stad (umac_rc.c:437-442). */
+    umac_rc_init_rate_table_data(stad, &tx_metadata->rc_data, false,
+                                 mmpkt_get_data_length(txbufview));
+
+    umac_stats_update_last_tx_time(umacd);
+
+    mmpkt_close(&txbufview);
+    /* S3 channel routing — mmdrv_tx_frame's 2nd arg is `is_mgmt` (queue select), NOT "blocking"; it only
+     * enqueues. Aggregating unicast goes on the DATA channel (is_mgmt=false) so the FW A-MPDUs it; the GROUP
+     * re-broadcast and the S3-off fallback stay on the MGMT channel (is_mgmt=true) — their pre-S3 queue.
+     * A broadcast on the ack-expecting DATA queue (is_mgmt=false without MMDRV_TX_FLAG_NO_ACK) would await
+     * an ACK that never comes, so group must not go there. */
+    if (mmdrv_tx_frame(txbuf, !fwd_aggregate) < 0)
+    {
+        return MMWLAN_ERROR;
+    }
+
+    return MMWLAN_SUCCESS;
+}
+
+/* Re-broadcast GROUP-addressed mesh data frame (umac_mesh_handle_group_data): forwarder's own MGTK. */
+enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad, struct mmpkt *txbuf)
+{
+    return umac_datapath_tx_mesh_keyed_frame(stad, txbuf, UMAC_KEY_TYPE_GROUP);
+}
+
+/* Forwarded UNICAST mesh data frame (umac_mesh_forward_data, ESP as an intermediate hop): encrypt
+ * under the NEXT HOP's pairwise MTK on its per-peer stad — net/mac80211 re-keys a forwarded unicast
+ * with tx->sta->ptk (the next-hop PTK). `stad` MUST be the next hop's per-peer stad. */
+enum mmwlan_status umac_datapath_tx_mesh_unicast_frame(struct umac_sta_data *stad, struct mmpkt *txbuf)
+{
+    return umac_datapath_tx_mesh_keyed_frame(stad, txbuf, UMAC_KEY_TYPE_PAIRWISE);
+}
+
+void umac_datapath_handle_tx_status(struct umac_data *umacd, struct mmpkt *mmpkt)
+{
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    if (tx_metadata->attempts != 0)
+    {
+        MMOSAL_TASK_ENTER_CRITICAL();
+        mmpkt_list_append(&data->tx_status_q, mmpkt);
+        MMOSAL_TASK_EXIT_CRITICAL();
+        umac_core_evt_wake(umacd);
+    }
+    else
+    {
+        mmpkt_release(mmpkt);
+    }
+    DATAPATH_TRACE("tx_status q %x", (uint32_t)mmpkt);
+}
+
+
+static inline void umac_datapath_process_tx_status_queue(struct umac_data *umacd,
+                                                         struct umac_datapath_data *data)
+{
+    struct mmpkt *mmpkt;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    mmpkt = mmpkt_list_dequeue_all(&data->tx_status_q);
+    MMOSAL_TASK_EXIT_CRITICAL();
+
+    struct mmpkt *next = NULL;
+    for (; mmpkt != NULL; mmpkt = next)
+    {
+        next = mmpkt_get_next(mmpkt);
+
+        DATAPATH_TRACE("tx_status deq %x", (uint32_t)mmpkt);
+
+        struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
+        MMOSAL_DEV_ASSERT(tx_metadata != NULL);
+
+        const struct umac_datapath_ops *datapath_ops =
+            umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+        if (datapath_ops == NULL)
+        {
+            MMLOG_WRN("No ops for VIF %u. Dropping TX frame\n", tx_metadata->vif_id);
+            mmpkt_release(mmpkt);
+            continue;
+        }
+
+
+        struct umac_sta_data *stad = datapath_ops->lookup_stad_by_aid(umacd, tx_metadata->aid);
+        if (stad != NULL)
+        {
+            bool frame_acked = (tx_metadata->status_flags & MMDRV_TX_STATUS_FLAG_NO_ACK) == 0;
+            bool valid_ack_status =
+                !(tx_metadata->status_flags &
+                  (MMDRV_TX_STATUS_FLAG_PS_FILTERED | MMDRV_TX_STATUS_DUTY_CYCLE_CANT_SEND));
+
+            MMLOG_VRB("TX status (0x%02x) indicates %s.\n",
+                      tx_metadata->status_flags,
+                      valid_ack_status ? (frame_acked ? "acked" : "unacked") : "unsent");
+
+            if (tx_metadata->aid != 0)
+            {
+                umac_rc_feedback(stad, tx_metadata);
+            }
+
+            if (valid_ack_status)
+            {
+                umac_connection_handle_ack_status(umacd, mmpkt, frame_acked);
+                umac_relay_handle_ack_status(umacd, mmpkt, frame_acked);
+            }
+
+
+            umac_supp_tx_status(umacd, mmpkt, (valid_ack_status ? frame_acked : false));
+
+            if (tx_metadata->status_flags & MMDRV_TX_STATUS_FLAGS_FAIL_MASK)
+            {
+                MMLOG_WRN("TX status indicates failure with flags 0x%02x\n",
+                          tx_metadata->status_flags & MMDRV_TX_STATUS_FLAGS_FAIL_MASK);
+            }
+        }
+        else
+        {
+            MMLOG_INF("No STA data - link down\n");
+        }
+
+        mmpkt_release(mmpkt);
+    }
+}
+
+static struct mmpkt *umac_datapath_build_3addr_to_ds_qos_null(struct umac_sta_data *stad)
+{
+    struct consbuf cbuf = CONSBUF_INIT_WITHOUT_BUF;
+    consbuf_reserve(&cbuf, sizeof(struct dot11_hdr));
+    consbuf_reserve(&cbuf, sizeof(struct dot11_qos_ctrl));
+
+    struct mmpkt *mmpkt =
+        umac_datapath_alloc_raw_tx_mmpkt(MMDRV_PKT_CLASS_DATA_TID7, 0, cbuf.offset);
+    if (mmpkt == NULL)
+    {
+        MMLOG_INF("Failed to allocate mgmt frame (len %lu)\n", cbuf.offset);
+        return NULL;
+    }
+    struct mmpktview *view = mmpkt_open(mmpkt);
+    consbuf_reinit_from_mmpkt(&cbuf, view);
+
+    struct dot11_hdr *header = (struct dot11_hdr *)consbuf_reserve(&cbuf, sizeof(struct dot11_hdr));
+    memset(header, 0, sizeof(*header));
+    umac_sta_data_get_bssid(stad, header->addr1);
+    umac_interface_get_mac_addr(stad, header->addr2);
+    umac_sta_data_get_bssid(stad, header->addr3);
+    header->frame_control = htole16(DOT11_MASK_FC_TO_DS |
+                                    (DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE) |
+                                    (DOT11_FC_SUBTYPE_QOS_NULL << DOT11_SHIFT_FC_SUBTYPE));
+
+    struct dot11_qos_ctrl *qos_ctrl =
+        (struct dot11_qos_ctrl *)consbuf_reserve(&cbuf, sizeof(struct dot11_qos_ctrl));
+    qos_ctrl->field = (DOT11_MASK_QC_TID & MMWLAN_MAX_QOS_TID);
+
+    uint8_t *ret = mmpkt_append(view, cbuf.offset);
+    MMOSAL_ASSERT(ret != NULL);
+
+    mmpkt_close(&view);
+
+    return mmpkt;
+}
+
+static struct mmpkt *umac_datapath_build_4addr_qos_null(struct umac_sta_data *stad)
+{
+    struct consbuf cbuf = CONSBUF_INIT_WITHOUT_BUF;
+    consbuf_reserve(&cbuf, sizeof(struct dot11_data_hdr));
+    consbuf_reserve(&cbuf, sizeof(struct dot11_qos_ctrl));
+
+    struct mmpkt *mmpkt =
+        umac_datapath_alloc_raw_tx_mmpkt(MMDRV_PKT_CLASS_DATA_TID7, 0, cbuf.offset);
+    if (mmpkt == NULL)
+    {
+        MMLOG_INF("Failed to allocate mgmt frame (len %lu)\n", cbuf.offset);
+        return NULL;
+    }
+    struct mmpktview *view = mmpkt_open(mmpkt);
+    consbuf_reinit_from_mmpkt(&cbuf, view);
+
+    struct dot11_data_hdr *header =
+        (struct dot11_data_hdr *)consbuf_reserve(&cbuf, sizeof(struct dot11_data_hdr));
+    memset(header, 0, sizeof(*header));
+    umac_sta_data_get_peer_addr(stad, header->base.addr1);
+    umac_interface_get_mac_addr(stad, header->base.addr2);
+    umac_sta_data_get_peer_addr(stad, header->base.addr3);
+    umac_interface_get_mac_addr(stad, header->addr4);
+    header->base.frame_control = htole16(DOT11_MASK_FC_TO_DS |
+                                         DOT11_MASK_FC_FROM_DS |
+                                         (DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE) |
+                                         (DOT11_FC_SUBTYPE_QOS_NULL << DOT11_SHIFT_FC_SUBTYPE));
+
+    struct dot11_qos_ctrl *qos_ctrl =
+        (struct dot11_qos_ctrl *)consbuf_reserve(&cbuf, sizeof(struct dot11_qos_ctrl));
+    qos_ctrl->field = (DOT11_MASK_QC_TID & MMWLAN_MAX_QOS_TID);
+
+    uint8_t *ret = mmpkt_append(view, cbuf.offset);
+    MMOSAL_ASSERT(ret != NULL);
+
+    mmpkt_close(&view);
+
+    return mmpkt;
+}
+
+static enum mmwlan_status umac_datapath_tx_qos_null_frame(struct umac_data *umacd,
+                                                          struct umac_sta_data *stad,
+                                                          struct mmpkt *mmpkt)
+{
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+    struct mmpktview *view = mmpkt_open(mmpkt);
+    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(view);
+
+
+    DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(
+        header->sequence_control,
+        sta_data->tx_seq_num_spaces[MMDRV_SEQ_NUM_QOS_NULL]++);
+
+
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
+    tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    tx_metadata->tid = MMWLAN_MAX_QOS_TID;
+    tx_metadata->aid = umac_sta_data_get_aid(stad);
+
+    umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+
+    umac_stats_update_last_tx_time(umacd);
+
+    mmpkt_close(&view);
+    enum mmwlan_status status = mmdrv_tx_frame(mmpkt, false);
+    if (status != MMWLAN_SUCCESS)
+    {
+        return status;
+    }
+
+    return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status umac_datapath_build_and_tx_to_ds_qos_null_frame(struct umac_sta_data *stad)
+{
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+
+    uint32_t timeout_ms = umac_datapath_calculate_tx_timeout_ms(umacd, true);
+    enum mmwlan_status status = umac_datapath_wait_for_tx_ready_(data, timeout_ms, UINT16_MAX);
+    if (status != MMWLAN_SUCCESS)
+    {
+        MMLOG_DBG("TX datapath blocked.\n");
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        return status;
+    }
+
+    struct mmpkt *mmpkt = umac_datapath_build_3addr_to_ds_qos_null(stad);
+    if (mmpkt == NULL)
+    {
+        return MMWLAN_ERROR;
+    }
+    return umac_datapath_tx_qos_null_frame(umacd, stad, mmpkt);
+}
+
+enum mmwlan_status umac_datapath_build_and_tx_4addr_qos_null_frame(struct umac_sta_data *stad)
+{
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+
+    uint32_t timeout_ms = umac_datapath_calculate_tx_timeout_ms(umacd, true);
+    enum mmwlan_status status = umac_datapath_wait_for_tx_ready_(data, timeout_ms, UINT16_MAX);
+    if (status != MMWLAN_SUCCESS)
+    {
+        MMLOG_DBG("TX datapath blocked.\n");
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        return status;
+    }
+
+    struct mmpkt *mmpkt = umac_datapath_build_4addr_qos_null(stad);
+    if (mmpkt == NULL)
+    {
+        return MMWLAN_ERROR;
+    }
+    return umac_datapath_tx_qos_null_frame(umacd, stad, mmpkt);
+}
+
+enum mmwlan_status umac_datapath_build_and_tx_mgmt_frame(struct umac_sta_data *stad,
+                                                         mgmt_frame_builder_t builder,
+                                                         void *params)
+{
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct mmpkt *txbuf = build_mgmt_frame(umacd, builder, params);
+    if (txbuf == NULL)
+    {
+        return MMWLAN_NO_MEM;
+    }
+
+    return umac_datapath_tx_mgmt_frame(stad, txbuf);
+}
+
+enum mmwlan_status umac_datapath_build_copy_and_queue_mgmt_frame_tx(struct umac_sta_data *stad,
+                                                                    mgmt_frame_builder_t builder,
+                                                                    void *params,
+                                                                    struct mmpkt **copy)
+{
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct mmpkt *txbuf = build_mgmt_frame(umacd, builder, params);
+    if (txbuf == NULL)
+    {
+        return MMWLAN_NO_MEM;
+    }
+
+    *copy = umac_datapath_copy_tx_mmpkt(txbuf, MMDRV_PKT_CLASS_MGMT);
+    if (*copy == NULL)
+    {
+        mmpkt_release(txbuf);
+        return MMWLAN_NO_MEM;
+    }
+
+    return umac_datapath_tx_mgmt_frame(stad, txbuf);
+}
+
+
+#ifndef UNIT_TESTS
+bool umac_datapath_process(struct umac_data *umacd)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    umac_datapath_process_tx_status_queue(umacd, data);
+    bool more_rx = umac_datapath_process_rx(umacd, data);
+    bool more_tx = umac_datapath_process_tx(umacd, data);
+    return more_rx || more_tx;
+}
+
+#else
+bool umac_datapath_process(struct umac_data *umacd)
+{
+    MM_UNUSED(umacd);
+    return false;
+}
+
+#endif
+
+static bool umac_datapath_pause_protected(struct umac_datapath_data *data, uint16_t source_mask)
+{
+    uint16_t old_pause = data->tx_paused;
+    data->tx_paused |= source_mask;
+    return old_pause == 0;
+}
+
+static bool umac_datapath_unpause_protected(struct umac_datapath_data *data, uint16_t source_mask)
+{
+    uint16_t old_pause = data->tx_paused;
+    data->tx_paused &= ~(source_mask);
+    return old_pause != 0 && data->tx_paused == 0;
+}
+
+static void umac_datapath_invoke_tx_fc_callback_handler(struct umac_data *umacd,
+                                                        const struct umac_evt *evt)
+{
+    MM_UNUSED(evt);
+
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    if (data->tx_flow_control_callback != NULL)
+    {
+        data->tx_flow_control_callback(data->tx_paused ? MMWLAN_TX_PAUSED : MMWLAN_TX_READY,
+                                       data->tx_flow_control_arg);
+    }
+}
+
+void umac_datapath_update_tx_paused(struct umac_data *umacd,
+                                    uint16_t source_mask,
+                                    mmdrv_host_update_tx_paused_cb_t cb)
+{
+    bool pause_state_changed;
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+
+    MMOSAL_TASK_ENTER_CRITICAL();
+    bool is_paused = cb();
+    if (is_paused)
+    {
+        pause_state_changed = umac_datapath_pause_protected(data, source_mask);
+    }
+    else
+    {
+        pause_state_changed = umac_datapath_unpause_protected(data, source_mask);
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+
+    MMLOG_DBG("Datapath paused (|= %08x): %d\n", source_mask, data->tx_paused);
+    DATAPATH_TRACE("pause %x %x %u", data->tx_paused, source_mask, pause_state_changed);
+
+    if (pause_state_changed && !is_paused)
+    {
+
+        umac_core_evt_wake(umacd);
+        mmosal_semb_give(data->tx_flowcontrol_sem);
+    }
+
+    if (pause_state_changed && data->tx_flow_control_callback != NULL)
+    {
+        if (umac_core_evtloop_is_active(umacd))
+        {
+            data->tx_flow_control_callback(is_paused ? MMWLAN_TX_PAUSED : MMWLAN_TX_READY,
+                                           data->tx_flow_control_arg);
+        }
+        else
+        {
+            bool ok;
+            const struct umac_evt evt = UMAC_EVT_INIT(umac_datapath_invoke_tx_fc_callback_handler);
+
+            ok = umac_core_evt_queue(umacd, &evt);
+            if (!ok)
+            {
+                MMLOG_WRN("Failed to queue INVOKE_TX_FC_CALLBACK event\n");
+            }
+        }
+    }
+}
+
+static bool return_true(void)
+{
+    return true;
+}
+
+static bool return_false(void)
+{
+    return false;
+}
+
+void umac_datapath_pause(struct umac_data *umacd, uint16_t source_mask)
+{
+    umac_datapath_update_tx_paused(umacd, source_mask, return_true);
+}
+
+void umac_datapath_unpause(struct umac_data *umacd, uint16_t source_mask)
+{
+    umac_datapath_update_tx_paused(umacd, source_mask, return_false);
+}
+
+void umac_datapath_handle_hw_restarted(struct umac_data *umacd, struct umac_sta_data *stad)
+{
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+
+    const uint8_t *peer_addr = umac_sta_data_peek_peer_addr(stad);
+
+    (void)mmdrv_set_seq_num_spaces(umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA),
+                                   sta_data->tx_seq_num_spaces,
+                                   peer_addr);
+}
+
+enum mmwlan_status umac_datapath_register_rx_frame_cb(struct umac_data *umacd,
+                                                      uint32_t filter,
+                                                      mmwlan_rx_frame_cb_t callback,
+                                                      void *arg)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    data->rx_frame_filter = filter;
+    data->rx_frame_cb = callback;
+    data->rx_frame_cb_arg = arg;
+    return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status umac_datapath_register_monitor_cb(struct umac_data *umacd,
+                                                     mmwlan_monitor_rx_cb_t callback,
+                                                     void *arg)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    data->monitor_cb_arg = arg;
+    data->monitor_cb = callback;
+    return MMWLAN_SUCCESS;
+}
